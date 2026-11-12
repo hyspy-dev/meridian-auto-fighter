@@ -1,0 +1,18 @@
+{
+  "name": "meridian-auto-fighter",
+  "version": "${project.version}",
+  "main": "meridian.autofighter.AutoFighterModule",
+  "priority": 50,
+  "dependsOn": {
+    "meridian-core": ">=0.1.0"
+  },
+  "requires": {
+    "services": [
+      "meridian.core.api.Movement",
+      "meridian.core.api.Navigator",
+      "meridian.core.api.EntityTracker",
+      "meridian.core.api.InteractionControl",
+      "meridian.core.api.World"
+    ]
+  }
+}
