@@ -1,11 +1,12 @@
 # meridian-auto-fighter
 
 Fights, with the player's own character or a headless one: fights back whoever attacks (Guard),
-hunts mobs in an area (Farm), or follows a player and defends them (Escort). It decides whom to
-fight and when to eat, block, run or repair. Walking, the hands and the reading of the fight are
-core's: `Navigator` (with its chase), `InteractionControl`, `EntityTracker` (health of every
-entity), `Combat` (who hit us, who winds up an attack) and `Movement` (the wheel, with urgent
-holds).
+hunts mobs in an area (Farm), or follows a player and defends them (Escort) - and, with no mode
+started, guards core's jobs (the auto-miner, the blueprint builder, a trip) from what attacks while
+they have the body. It decides whom to fight and when to eat, block, run or repair. Walking, the
+hands and the reading of the fight are core's: `Navigator` (with its chase), `InteractionControl`,
+`EntityTracker` (health of every entity), `Combat` (who hit us, who winds up an attack) and
+`Movement` (the wheel, with urgent holds).
 
 It is a Layer-2 module: meridian-api and meridian-core-api only, no packets.
 
@@ -25,10 +26,11 @@ It is a Layer-2 module: meridian-api and meridian-core-api only, no packets.
 | Repair | `InteractionControl.repair(item)` | see "Repair" below |
 | A moving goal | `Navigator.chase(target, within)` | core's own `Walker`: the way is found again when the target has moved off the cell it was found to; done once within reach |
 | Wheel priority | `Movement.takeFirst()` | core: while an urgent hold is held, a trip, a dig or a swing loop begun before it waits, and goes on from where the body is when the last urgent hold is given back |
+| Whether a job has the body | `Movement.holds()` | core counts the holds on the body - a headless one's too - leaving out urgent ones and what is started under them |
+| A guard that cuts our swing short | `InteractionControl.useItem(hold, interrupt)` | the swing's own rules (`InterruptedBy: Secondary` on the sword's wind-up); the server cancels the swing by the same rules when the guard comes in (`InteractionManager.applyRules`) |
 | The best weapon | `Player.bestWeaponSlot()` | the item catalog's `weapon` and `itemLevel`, the swing's reach, the hotbar's durability |
 
-Core's own write-up: [meridian-core/docs/combat.md](../meridian-core/docs/combat.md) (on the
-`combat` branch).
+Core's own write-up: [meridian-core/docs/combat.md](../meridian-core/docs/combat.md).
 
 ### Hostility
 
@@ -58,7 +60,13 @@ One target at a time - the one hitting us, else the nearest enemy. Each beat (ab
 3. **Face**: the head turns to the middle of the target's box (`Movement.face`).
 4. **Block** (with a weapon that guards, stamina above 2):
    - the moment the target begins an attack (`Combat.Listener.swing`, on the network's thread), the
-     guard goes up for 0.65 s (`useItem(hold)`) - after our swing under way, if there is one;
+     guard goes up for 0.65 s (`useItem(hold, interrupt)`). Our swing under way it cuts short, as the
+     game does, where the swing's rules let a guard in: a sword's swing until its blow (its first
+     ~0.13 s of 0.32) - and core cuts only where the server is sure to be there still, the first
+     ~40 ms. The server cancels that swing - its blow does not land - and the guard goes up at
+     once. Past that point, or with **Overpower** on, the guard goes up after the swing,
+     which lands: more than the game lets a player do, and the server takes it. Swings cut short
+     are counted as `cut`;
    - by its rhythm: once it has attacked, swings go on only within the window it leaves - the
      shortest gap seen between its attacks less 0.5 s (1.5 s before it has attacked twice); past
      that its next blow is near, so the body waits with nothing of its own in the guard's way, for
@@ -87,20 +95,36 @@ A kill is a target that falls (its health at its min, or gone) within 5 s of our
 - Between fights Guard takes an urgent hold for a heal or a repair too, so a job under way does not
   swing with the potion in hand.
 
-### How Guard takes the wheel from another job
+### When the fighter takes the wheel
 
-Guard watches all the time (it holds nothing while idle). When an enemy shows up it takes an
-**urgent hold** (`Movement.takeFirst()`): the job under way - the auto-miner's dig, the blueprint's
-placing, a "Go to a point" trip - is held back by core, not ended: its move under way stops, its
-trip waits, its swing loop waits between swings. Guard fights, then gives the hold back, and the
-job goes on from where the body is (its trip finds the way again). The job's own hold stays all
-the time, so the body never goes back to the game in between. A key the player presses ends
-everything, as always.
+Three cases (the user's decision of 12.11.2026):
+
+- **A core job has the body, Guard not started** - the auto-miner digging, the blueprint building,
+  a "Go to a point" trip: another hold of core's `Movement` is held (`Movement.holds() > 0`). With
+  **Guard the miner and builder** on (the default), a sentry runs whenever no mode is started: it
+  fights what attacks by Guard's rules, and the job goes on after. A fight of the sentry's is over
+  the moment the job is (stopped meanwhile, or the player took the body): the body is the
+  player's then. Between fights it heals or repairs only while a job has the body.
+- **Guard started by hand** - it fights whether a job has the body or the player plays by hand,
+  taking the body for the fight from either. After a key the player presses in a fight it leaves
+  the body to them for 10 s.
+- **Neither** (no mode started, no job has the body, or the setting off) - the fighter never takes
+  the body from the player. (Farm and Escort hold the body for their whole job, as before.)
+
+How a fight takes the wheel from a job: an **urgent hold** (`Movement.takeFirst()`). The job under
+way is held back by core, not ended: its move under way stops, its trip waits, its swing loop waits
+between swings. The fighter fights, then gives the hold back, and the job goes on from where the
+body is (its trip finds the way again). The job's own hold stays all the time, so the body never
+goes back to the game in between. Under the urgent hold, the fighter's own chase trips are not
+counted as a job (`holds()` leaves out what is started under an urgent hold). A key the player
+presses ends everything, as always.
 
 ### Modes, settings and commands
 
 In the proxy's window, the **Fight** section:
 
+- **Guard the miner and builder** (on): with no mode started, fight for a core job that has the
+  body (above).
 - **Mode**: Guard / Farm / Escort (Stop is off).
 - **Targets**: hostile kinds (a list), players too (off by default), the guard radius.
 - **Farm**: which kind (a part of the model id), how many (-1: no end), the area (around where
@@ -109,9 +133,14 @@ In the proxy's window, the **Fight** section:
   the player carries more of since the job began. Farm ends after 15 s with nothing of the kind
   about.
 - **Escort**: the player's name, the distance kept.
-- **Survival**: heal at %, retreat at %, block (on), repair (on).
+- **Survival**: heal at %, retreat at %, block (on), **Overpower** (off: the guard cuts our swing
+  short as the game does; on: the swing always lands, the guard after it), repair (on).
 - **Outline the target** (on): the target's box in red, through walls (`DebugRender`).
-- **Start**, **Stop**, and a status line.
+- **Start**, **Stop**, and a status line. Stop ends the mode started; the sentry goes on while
+  its setting is on.
+
+Every choice of the panel is kept across restarts (`SettingsSpec.persistent`): the saved values
+come back through the same setters at the start.
 
 On the command channel:
 
@@ -119,11 +148,14 @@ On the command channel:
 fight <conn> guard [radius]                    -> starts guarding; {mode, radius}
 fight <conn> farm <kind> [count] [radius]      -> answered when done: {status, kills, picked, ...}
 fight <conn> escort <player> [distance]        -> starts escorting; {mode, player}
-fight <conn> stop                              -> {stopped, status, kills, swings, guards, blocked, ...}
-fight <conn> status                            -> {mode, status, target, fighting, kills, guards, blocked,
-                                                   heals, retreats, repairs, picked, hitsTaken, damageTaken, health}
-fight <conn> set heal|retreat <percent> | set block|repair|players|pickup on|off
+fight <conn> stop                              -> {stopped, status, kills, swings, cut, guards, blocked, ...}
+fight <conn> status                            -> {mode, status, guardJobs, target, fighting, kills, swings, cut,
+                                                   guards, blocked, heals, retreats, repairs, picked, hitsTaken,
+                                                   damageTaken, health}
+fight <conn> set heal|retreat <percent> | set block|repair|players|pickup|guardjobs|overpower on|off
 fight <conn> set hostile <kind,kind,...> | set radius <blocks>
+
+mode: OFF | GUARD | FARM | ESCORT | SENTRY (no mode started, guarding the jobs)
 
 status: DONE | NOTHING | STOPPED | INTERRUPTED (the player took the body) | DIED | NOT_AVAILABLE | FAILED
 ```
@@ -147,10 +179,14 @@ That is `InteractionControl.repair(item)`.
 - **Bows and other ranged weapons.** The fight is melee only. `hitReach` is empty for a bow, so
   `Player.bestWeaponSlot` never picks one, and a ranged fight would slot in as another way to
   attack, beside the swing: `swing(hold)` already draws and shoots.
-- **A guard does not cut a swing short.** The client lets a guard interrupt a sword's swing
-  (`InterruptedBy: Secondary`); core plays one chain after another, so a guard raised during our
-  own swing goes out when that swing is over. Against a zombie (its blow lands about 0.3 s after
-  its attack shows) many attacks are seen too late to block.
+- **A guard asked for late in our swing waits for the swing.** Only the sword's wind-up lets a guard
+  in (its blow and the 0.16 s after it do not), and core cuts only in its first ~40 ms, where the
+  server is sure to be still in it (a server ahead of the cut keeps the guard back and stalls the
+  swing for 3 s); a zombie's attack seen later is guarded once our swing is over - its blow lands
+  about 0.3 s after its attack shows.
+- **"The player plays by hand" is not seen on a headless stand.** A headless body has no player;
+  the stand checks that the sentry takes nothing with no hold held, and that Guard started by hand
+  fights with none.
 - **A shield in the utility slot on a headless player.** Core forges with the utility item once it
   knows which utility slot is active; the server never tells a headless player that.
 - **Food out of the hotbar.** Only the hotbar is looked at for healing items, weapons and kits.

@@ -21,6 +21,7 @@ import meridian.core.api.DebugRender;
 import meridian.core.api.EntityTracker;
 import meridian.core.api.Goal;
 import meridian.core.api.InteractionControl;
+import meridian.core.api.InteractionOutcome;
 import meridian.core.api.Movement;
 import meridian.core.api.NavResult;
 import meridian.core.api.Navigator;
@@ -37,7 +38,11 @@ import org.slf4j.Logger;
  * <ul>
  *   <li><b>Guard</b> watches without holding the body. When an enemy shows up it takes an urgent
  *       hold ({@link Movement#takeFirst}), so a job under way - the auto-miner's, the builder's -
- *       waits; it fights, then gives the hold back and that job goes on.</li>
+ *       waits; it fights, then gives the hold back and that job goes on. With no job, it takes the
+ *       body from the player playing by hand, and leaves it to them a while after a key.</li>
+ *   <li><b>Sentry</b> - no mode started, "Guard the miner and builder" on - is Guard for core's
+ *       jobs only: it fights only while another hold has the body ({@link Movement#holds}), and
+ *       never takes the body from the player playing by hand.</li>
  *   <li><b>Farm</b> holds the body for the job and hunts mobs of a kind round where it started,
  *       picking up what they drop.</li>
  *   <li><b>Escort</b> holds the body, follows a player and fights what threatens them.</li>
@@ -52,8 +57,11 @@ import org.slf4j.Logger;
  */
 final class Fighter {
 
-    /** What the fighter is doing. */
-    enum Mode { OFF, GUARD, FARM, ESCORT }
+    /**
+     * What the fighter is doing. {@code SENTRY}: no mode started, guarding the jobs that have the
+     * body ("Guard the miner and builder").
+     */
+    enum Mode { OFF, GUARD, FARM, ESCORT, SENTRY }
 
     /**
      * How it fights.
@@ -66,18 +74,21 @@ final class Fighter {
      * @param block     raise the guard when the target begins an attack
      * @param repair    repair a worn weapon with a kit from the hotbar
      * @param pickUp    Farm: pick up what the kills drop
+     * @param overpower the guard waits for our swing under way, which lands: what the server lets
+     *                  through. Off, the guard cuts the swing short where its rules let it, as the
+     *                  game does ({@link InteractionControl#useItem(Duration, boolean)})
      */
     record Options(List<String> hostile, boolean players, double radius, int healAt, int retreatAt, boolean block,
-                   boolean repair, boolean pickUp) {
+                   boolean repair, boolean pickUp, boolean overpower) {
 
         static final List<String> HOSTILE = List.of("Zombie", "Skeleton", "Spider", "Goblin", "Trork", "Scarak",
                 "Wraith", "Void", "Ghoul", "Outlander");
-        static final Options DEFAULT = new Options(HOSTILE, false, 12, 50, 25, true, true, true);
+        static final Options DEFAULT = new Options(HOSTILE, false, 12, 50, 25, true, true, true, false);
     }
 
     /** What a job did. */
-    record Result(String status, int kills, int swings, int guards, int blocked, int heals, int retreats, int repairs,
-                  int picked, int hitsTaken, double damageTaken, long millis) {}
+    record Result(String status, int kills, int swings, int cut, int guards, int blocked, int heals, int retreats,
+                  int repairs, int picked, int hitsTaken, double damageTaken, long millis) {}
 
     /** A beat, in milliseconds. */
     static final long BEAT_MS = 50;
@@ -122,6 +133,8 @@ final class Fighter {
     static final long RETREAT_COOLDOWN_MS = 8000;
     /** A player who takes the body back in a Guard fight is left to it for this long. */
     static final long PLAYER_TOOK_MS = 10_000;
+    /** A sentry with no job to guard looks again this often. */
+    static final long SENTRY_IDLE_MS = 200;
     /** Farm: with nothing of the kind about for this long, the job is over. */
     static final long FARM_IDLE_MS = 15_000;
     /** Drops are looked for this near where a kill fell. */
@@ -170,6 +183,10 @@ final class Fighter {
     private volatile String status = "Off.";
     private volatile Job current;
     private volatile boolean showTarget = true;
+    /** "Guard the miner and builder": with no mode started, a sentry guards the jobs that have the body. */
+    private volatile boolean guardJobs;
+    /** The options as the panel has them now - what the sentry fights by. */
+    private volatile java.util.function.Supplier<Options> liveOptions = () -> Options.DEFAULT;
 
     Fighter(Movement movement, Navigator navigator, EntityTracker entities, InteractionControl hands, World world,
             Combat combat, PlayerState state, Worker worker, DebugRender debug, Executor executor, Logger log) {
@@ -194,6 +211,39 @@ final class Fighter {
         return status;
     }
 
+    /** The options the sentry takes, as they are at each beat. */
+    void liveOptions(java.util.function.Supplier<Options> options) {
+        this.liveOptions = options == null ? () -> Options.DEFAULT : options;
+    }
+
+    /**
+     * "Guard the miner and builder": on, with no mode started, a sentry fights for the jobs that have
+     * the body - never taking it from the player playing by hand; off, it is stopped.
+     */
+    synchronized void guardJobs(boolean on) {
+        guardJobs = on;
+        if (on && mode == Mode.OFF) {
+            sentry();
+        } else if (!on && mode == Mode.SENTRY) {
+            job.incrementAndGet();
+        }
+    }
+
+    boolean guardsJobs() {
+        return guardJobs;
+    }
+
+    /** The module is going: whatever runs stops, and the sentry is not started again. */
+    synchronized void shutdown() {
+        guardJobs = false;
+        job.incrementAndGet();
+    }
+
+    /** Starts the sentry. Called with the monitor held, when no mode runs. */
+    private void sentry() {
+        start(new Job(job.incrementAndGet(), Mode.SENTRY, null, null, -1, null, 0));
+    }
+
     void showTarget(boolean on) {
         showTarget = on;
         if (!on) {
@@ -206,6 +256,7 @@ final class Fighter {
         Map<String, Object> out = new java.util.LinkedHashMap<>();
         out.put("mode", mode.name());
         out.put("status", status);
+        out.put("guardJobs", guardJobs);
         Job j = current;
         if (j != null) {
             out.put("target", j.target);
@@ -224,6 +275,7 @@ final class Fighter {
         out.put("status", r.status());
         out.put("kills", r.kills());
         out.put("swings", r.swings());
+        out.put("cut", r.cut());
         out.put("guards", r.guards());
         out.put("blocked", r.blocked());
         out.put("heals", r.heals());
@@ -241,7 +293,7 @@ final class Fighter {
     // ------------------------------------------------------------------
 
     /** Guards until stopped: fights whoever is an enemy round the body, taking the wheel from any job meanwhile. */
-    CompletableFuture<Result> guard(Options options) {
+    synchronized CompletableFuture<Result> guard(Options options) {
         return start(new Job(job.incrementAndGet(), Mode.GUARD, options, null, -1, null, 0));
     }
 
@@ -249,30 +301,34 @@ final class Fighter {
      * Farms {@code count} mobs whose model id holds {@code kind} (under 1: as long as there are
      * any) within {@code radius} of where the body is now.
      */
-    CompletableFuture<Result> farm(String kind, int count, double radius, Options options) {
+    synchronized CompletableFuture<Result> farm(String kind, int count, double radius, Options options) {
         Vec3 here = movement.position();
         return start(new Job(job.incrementAndGet(), Mode.FARM, options, kind, count < 1 ? -1 : count, here, radius));
     }
 
     /** Escorts the player named so, keeping within {@code distance} of them, until stopped. */
-    CompletableFuture<Result> escort(String player, double distance, Options options) {
+    synchronized CompletableFuture<Result> escort(String player, double distance, Options options) {
         Job j = new Job(job.incrementAndGet(), Mode.ESCORT, options, null, -1, null, distance);
         j.escorted = player;
         return start(j);
     }
 
-    /** Stops the job under way; completes once it has given everything back. */
-    CompletableFuture<Result> stop() {
+    /**
+     * Stops the job under way; completes once it has given everything back. The sentry starts again
+     * after it while "Guard the miner and builder" is on.
+     */
+    synchronized CompletableFuture<Result> stop() {
         job.incrementAndGet();
         return running.handle((r, e) -> r);
     }
 
-    private CompletableFuture<Result> start(Job j) {
+    private synchronized CompletableFuture<Result> start(Job j) {
         CompletableFuture<Result> before = running;
         CompletableFuture<Result> done = new CompletableFuture<>();
         running = done;
         mode = j.mode;
         executor.execute(() -> {
+            Result r = null;
             try {
                 try {
                     before.get(30, TimeUnit.SECONDS);   // the one before gives its holds back first
@@ -280,7 +336,7 @@ final class Fighter {
                     // ended badly or slowly: this one goes on
                 }
                 current = j;
-                Result r = run(j);
+                r = run(j);
                 status = text(j, r);
                 log.info("auto-fighter: {}", status);
                 done.complete(r);
@@ -289,12 +345,25 @@ final class Fighter {
                 status = "Failed: " + t;
                 done.completeExceptionally(t);
             } finally {
-                if (running == done) {
-                    mode = Mode.OFF;
-                }
+                over(done, j, r);
             }
         });
         return done;
+    }
+
+    /**
+     * A job is over: with nothing started after it, the mode is off - and the sentry takes over while
+     * "Guard the miner and builder" is on (a sentry that failed is left off, not started in a loop).
+     */
+    private synchronized void over(CompletableFuture<Result> done, Job j, Result r) {
+        if (running != done) {
+            return;
+        }
+        mode = Mode.OFF;
+        boolean failed = r == null || "FAILED".equals(r.status());
+        if (guardJobs && !(j.mode == Mode.SENTRY && failed)) {
+            sentry();
+        }
     }
 
     /** One job's state; only its own thread touches the most of it. */
@@ -334,6 +403,10 @@ final class Fighter {
         long idleSince = System.currentTimeMillis();
         int kills;
         int swings;
+        /** Our swings the guard cut short (the server cancelled them), the game's way. */
+        int cut;
+        /** When the guard was last raised the moment an attack showed. */
+        volatile long guardRaisedAt;
         final AtomicInteger guards = new AtomicInteger();
         /** Blows that came while the guard was up and did no harm. */
         final AtomicInteger blocked = new AtomicInteger();
@@ -376,17 +449,23 @@ final class Fighter {
         }
 
         boolean live() {
-            return job.get() == id && (lost == null || mode == Mode.GUARD);
+            return job.get() == id && (lost == null || mode == Mode.GUARD || mode == Mode.SENTRY);
+        }
+
+        /** How it fights: the options it was started with; the sentry's, as the panel has them now. */
+        Options options() {
+            return mode == Mode.SENTRY ? liveOptions.get() : options;
         }
 
         Result result(String how) {
-            return new Result(how, kills, swings, guards.get(), blocked.get(), heals, retreats, repairs,
+            return new Result(how, kills, swings, cut, guards.get(), blocked.get(), heals, retreats, repairs,
                     picked + gained(this), hitsTaken, damageTaken, System.currentTimeMillis() - began);
         }
     }
 
     private Result run(Job j) {
-        if (!movement.available() && !navigator.available()) {
+        if (j.mode != Mode.SENTRY && !movement.available() && !navigator.available()) {
+            // (The sentry waits for a body: it starts with the module, before there is one.)
             return j.result("NOT_AVAILABLE");
         }
         if (combat != null) {
@@ -394,7 +473,7 @@ final class Fighter {
         }
         String end = "STOPPED";
         try {
-            if (j.mode != Mode.GUARD) {
+            if (j.mode == Mode.FARM || j.mode == Mode.ESCORT) {
                 // Farm and Escort hold the body for the whole job.
                 j.wheel = movement.take().orElse(null);
                 if (j.wheel == null) {
@@ -414,24 +493,32 @@ final class Fighter {
                 if (j.target >= 0 && !alive(j.target)) {
                     gone(j, j.target);
                 }
-                String over = switch (j.mode) {
-                    case GUARD -> guardBeat(j);
-                    case FARM -> farmBeat(j);
-                    case ESCORT -> escortBeat(j);
-                    case OFF -> "STOPPED";
-                };
+                String over;
+                try {
+                    over = switch (j.mode) {
+                        case GUARD, SENTRY -> guardBeat(j);
+                        case FARM -> farmBeat(j);
+                        case ESCORT -> escortBeat(j);
+                        case OFF -> "STOPPED";
+                    };
+                } catch (java.util.concurrent.TimeoutException slow) {
+                    // A swing, a guard or a switch the server took long over: the next beat sees how it stands.
+                    log.info("auto-fighter: a forge took too long - on with the next beat");
+                    over = null;
+                }
                 if (over != null) {
                     end = over;
                     break;
                 }
-                long left = BEAT_MS - (System.currentTimeMillis() - t0);
+                long beat = j.mode == Mode.SENTRY && !j.fighting && !jobHolds() ? SENTRY_IDLE_MS : BEAT_MS;
+                long left = beat - (System.currentTimeMillis() - t0);
                 if (left > 0) {
                     Thread.sleep(left);
                 }
             }
             if (j.lost == Movement.Release.DEATH) {
                 end = "DIED";
-            } else if (j.lost != null && j.mode != Mode.GUARD) {
+            } else if (j.lost != null && (j.mode == Mode.FARM || j.mode == Mode.ESCORT)) {
                 end = "INTERRUPTED";
             }
             return j.result(end);
@@ -461,38 +548,54 @@ final class Fighter {
     // The modes
     // ------------------------------------------------------------------
 
-    /** A Guard beat: a fight when an enemy is about, else nothing - or a heal or a repair, quickly, if one is due. */
+    /**
+     * A Guard beat: a fight when an enemy is about, else nothing - or a heal or a repair, quickly, if
+     * one is due. The sentry's too, while a job has the body: with none, it does nothing at all, and a
+     * fight of its own is over the moment the job is (the body is the player's then).
+     */
     private String guardBeat(Job j) throws Exception {
-        Vec3 me = movement.position();
-        if (me == null) {
-            status = "Guarding: the player is nowhere yet.";
+        boolean sentry = j.mode == Mode.SENTRY;
+        String who = sentry ? "Guarding the job" : "Guarding";
+        if (sentry && !jobHolds()) {
+            if (j.fighting) {
+                endFight(j);
+                log.info("auto-fighter: the job is over - the fight with it");
+            }
+            j.lost = null;
+            status = "Guarding the miner and builder: no job has the body.";
             return null;
         }
-        List<Integer> enemies = enemies(j, me, j.options.radius(), me);
+        Vec3 me = movement.position();
+        if (me == null) {
+            status = who + ": the player is nowhere yet.";
+            return null;
+        }
+        List<Integer> enemies = enemies(j, me, j.options().radius(), me);
         if (enemies.isEmpty()) {
             if (j.fighting) {
                 endFight(j);
             }
-            status = "Guarding: no enemy about.";
+            status = who + ": no enemy about.";
             upkeep(j, me);
             return null;
         }
         if (!j.fighting) {
             if (System.currentTimeMillis() < j.playerTookUntil) {
-                status = "Guarding: the player has the body.";
+                status = who + ": the player has the body.";
                 return null;
             }
             if (!beginFight(j)) {
-                status = "Guarding: an enemy, but the body cannot be taken.";
+                status = who + ": an enemy, but the body cannot be taken.";
                 return null;
             }
         }
         if (j.lost != null) {
-            // The game took the body in the fight: a key (left to the player a while), a death.
-            if (j.lost == Movement.Release.DEATH) {
+            // The game took the body in the fight: a key (left to the player a while), a death. The
+            // sentry's job went with it; the sentry watches on.
+            if (j.lost == Movement.Release.DEATH && !sentry) {
                 return "DIED";
             }
-            if (j.lost == Movement.Release.PLAYER) {
+            if (j.lost == Movement.Release.PLAYER && !sentry) {
                 j.playerTookUntil = System.currentTimeMillis() + PLAYER_TOOK_MS;
             }
             j.lost = null;
@@ -515,7 +618,7 @@ final class Fighter {
         if (me == null) {
             return "NOT_AVAILABLE";
         }
-        List<Integer> enemies = enemies(j, me, j.options.radius(), me);
+        List<Integer> enemies = enemies(j, me, j.options().radius(), me);
         List<Integer> prey = new ArrayList<>();
         for (int id : sorted(me, entities.trackedEntities())) {
             Vec3 at = entities.positionOf(id).orElse(null);
@@ -564,7 +667,7 @@ final class Fighter {
             log.info("auto-fighter: escorting {} ({})", j.escorted, who);
             j.escortSeen = true;
         }
-        List<Integer> threats = enemies(j, them, j.options.radius(), me);
+        List<Integer> threats = enemies(j, them, j.options().radius(), me);
         threats.remove((Integer) who);
         if (!threats.isEmpty()) {
             fight(j, choose(j, threats, them), me);
@@ -622,9 +725,9 @@ final class Fighter {
                     && (dist(at, me) <= SWING_NEAR || fromCenter <= SWING_NEAR);
             boolean enemy;
             if (player) {
-                enemy = j.options.players() && (hitUs || swung);
+                enemy = j.options().players() && (hitUs || swung);
             } else {
-                enemy = hitUs || swung || (fromCenter <= radius && hostileKind(id, j.options.hostile()));
+                enemy = hitUs || swung || (fromCenter <= radius && hostileKind(id, j.options().hostile()));
             }
             if (enemy && fromCenter <= radius + LEASH) {
                 out.add(id);
@@ -740,8 +843,23 @@ final class Fighter {
                 j.lost = why;
             }
         });
-        log.info("auto-fighter: an enemy - the body taken for the fight");
+        log.info("auto-fighter: an enemy - the body taken for the fight{}",
+                j.mode == Mode.SENTRY ? " (a job has it: it waits)" : "");
         return true;
+    }
+
+    /** Guard and the sentry: they hold nothing between fights, and take the body first for one. */
+    private static boolean guarding(Job j) {
+        return j.mode == Mode.GUARD || j.mode == Mode.SENTRY;
+    }
+
+    /**
+     * Whether another's job has the body - a hold of core's Movement other than ours: the auto-miner's,
+     * the builder's, a trip. An urgent hold of ours, and what we start under it, are not counted
+     * ({@link Movement#holds}); a core too old to tell has none.
+     */
+    private boolean jobHolds() {
+        return movement.holds() > 0;
     }
 
     /** Guard: the fight is over - the slot held before taken again, the body given back to whoever had it. */
@@ -781,11 +899,11 @@ final class Fighter {
         mark(target, at);
         double hp = health().orElse(1.0);
         int healSlot = healSlot();
-        if (hp * 100 <= j.options.retreatAt() && healSlot >= 0 && System.currentTimeMillis() > j.retreatAgain) {
+        if (hp * 100 <= j.options().retreatAt() && healSlot >= 0 && System.currentTimeMillis() > j.retreatAgain) {
             retreat(j, target, me);
             return;
         }
-        if (hp * 100 <= j.options.healAt() && healSlot >= 0 && !coming(target)) {
+        if (hp * 100 <= j.options().healAt() && healSlot >= 0 && !coming(target)) {
             heal(j, healSlot);
             return;
         }
@@ -809,7 +927,7 @@ final class Fighter {
         } catch (java.util.concurrent.TimeoutException turning) {
             // swung all the same: the server takes the hit from the client
         }
-        if (j.options.block() && combat != null && guardsWith(held) && stamina() > GUARD_STAMINA) {
+        if (j.options().block() && combat != null && guardsWith(held) && stamina() > GUARD_STAMINA) {
             Optional<Combat.Swing> coming = combat.swingOf(target, WINDING_UP);
             if (coming.isPresent() && !Integer.valueOf(coming.get().chain()).equals(j.guarded.get(target))
                     && eyesTo(target) <= ENEMY_REACH) {
@@ -817,7 +935,7 @@ final class Fighter {
                 status = "Fighting " + entities.labelOf(target) + ": guarding.";
                 j.guards.incrementAndGet();
                 j.guardUp.put(target, System.currentTimeMillis());
-                hands.useItem(GUARD_HOLD).get(3, TimeUnit.SECONDS);
+                hands.useItem(GUARD_HOLD, !j.options().overpower()).get(3, TimeUnit.SECONDS);
                 return;
             }
             if (blowDue(j, target)) {
@@ -838,9 +956,14 @@ final class Fighter {
         }
         status = "Fighting " + entities.labelOf(target) + ".";
         j.swings++;
-        j.struck.put(target, System.currentTimeMillis());
+        long swungAt = System.currentTimeMillis();
+        j.struck.put(target, swungAt);
         snapshotItems(j);
-        hands.hitEntity(target).get(3, TimeUnit.SECONDS);
+        InteractionOutcome swing = hands.hitEntity(target).get(3, TimeUnit.SECONDS);
+        if (swing != null && swing.status() == InteractionOutcome.Status.CANCELLED && j.guardRaisedAt >= swungAt) {
+            // The guard raised in it cut it short, as the game does: its blow did not land.
+            j.cut++;
+        }
         if (!alive(target)) {
             gone(j, target);
         }
@@ -849,11 +972,12 @@ final class Fighter {
     /**
      * An attack shows begun - the moment the server says so, on the network's thread: when it is the
      * target's, or an enemy's that reaches us, and the held item guards, the guard is raised at once.
-     * It goes out after the swing under way, if one is (core plays chains one after another); a
-     * beat would only see it after that swing too, and later.
+     * A swing of ours under way it cuts short where the swing's rules let it (a sword's, until its
+     * blow), as the game does; with "Overpower", or past that point, it goes out after the swing.
+     * A beat would only see the attack after that swing too, and later.
      */
     private void guardAgainst(Job j, Combat.Swing w) {
-        if (!j.options.block() || j.target < 0 || job.get() != j.id) {
+        if (!j.options().block() || j.target < 0 || job.get() != j.id) {
             return;
         }
         if (w.entity() != j.target && eyesTo(w.entity()) > ENEMY_REACH) {
@@ -877,7 +1001,8 @@ final class Fighter {
         if (at != null) {
             movement.face(aimAt(w.entity(), at), Math.toRadians(10));
         }
-        j.guard = hands.useItem(GUARD_HOLD);
+        j.guardRaisedAt = System.currentTimeMillis();
+        j.guard = hands.useItem(GUARD_HOLD, !j.options().overpower());
     }
 
     /**
@@ -909,7 +1034,7 @@ final class Fighter {
             stopChase(j);
             unmark();
         }
-        if (ours && j.mode == Mode.FARM && j.options.pickUp() && where != null && worker != null) {
+        if (ours && j.mode == Mode.FARM && j.options().pickUp() && where != null && worker != null) {
             pickUpAt(j, where);
         }
     }
@@ -993,7 +1118,7 @@ final class Fighter {
             return;     // no weapon: what is held, or the hand
         }
         String id = p.hotbarItem(slot);
-        if (j.options.repair() && worn(slot) && !j.fighting) {
+        if (j.options().repair() && worn(slot) && !j.fighting) {
             if (Boolean.TRUE.equals(hands.repair(id).get(15, TimeUnit.SECONDS))) {
                 j.repairs++;
             }
@@ -1026,15 +1151,15 @@ final class Fighter {
     private void upkeep(Job j, Vec3 me) throws Exception {
         double hp = health().orElse(1.0);
         int healSlot = healSlot();
-        boolean heal = hp * 100 <= j.options.healAt() && healSlot >= 0;
+        boolean heal = hp * 100 <= j.options().healAt() && healSlot >= 0;
         Player p = world.player().orElse(null);
         int weapon = p == null ? -1 : p.bestWeaponSlot();
-        boolean repair = j.options.repair() && weapon >= 0 && worn(weapon) && kitInHotbar();
+        boolean repair = j.options().repair() && weapon >= 0 && worn(weapon) && kitInHotbar();
         if (!heal && !repair) {
             return;
         }
         // Guard holds nothing between fights: a job under way waits for the heal or the repair too.
-        Movement.Wheel w = j.mode == Mode.GUARD ? movement.takeFirst().orElse(null) : null;
+        Movement.Wheel w = guarding(j) ? movement.takeFirst().orElse(null) : null;
         int back = p == null ? -1 : p.activeHotbarSlot();
         try {
             if (heal) {
@@ -1043,7 +1168,7 @@ final class Fighter {
             if (repair && Boolean.TRUE.equals(hands.repair(p.hotbarItem(weapon)).get(15, TimeUnit.SECONDS))) {
                 j.repairs++;
             }
-            if (j.mode == Mode.GUARD && back >= 0 && p.activeHotbarSlot() != back) {
+            if (guarding(j) && back >= 0 && p.activeHotbarSlot() != back) {
                 hands.switchHotbarSlot(back).get(3, TimeUnit.SECONDS);
             }
         } finally {
@@ -1106,7 +1231,7 @@ final class Fighter {
         hands.useItem().get(10, TimeUnit.SECONDS);
         j.heals++;
         log.info("auto-fighter: healed with {} - health {}", id, health().map(h -> Math.round(h * 100)).orElse(-1L));
-        if (back >= 0 && back != slot && j.mode != Mode.GUARD) {
+        if (back >= 0 && back != slot && !guarding(j)) {
             hands.switchHotbarSlot(back).get(3, TimeUnit.SECONDS);
         }
     }
@@ -1350,13 +1475,14 @@ final class Fighter {
     private static String text(Job j, Result r) {
         String what = switch (j.mode) {
             case GUARD -> "Guard";
+            case SENTRY -> "Guarding the miner and builder";
             case FARM -> "Farm " + j.kind;
             case ESCORT -> "Escort " + j.escorted;
             case OFF -> "Off";
         };
-        return String.format(Locale.ROOT, "%s over (%s): %d killed, %d swings, %d guards (%d blocked), %d heals, "
-                        + "%d retreats, %d repairs, %d picked up, %d hits taken (%.0f damage).", what, r.status(),
-                r.kills(), r.swings(), r.guards(), r.blocked(), r.heals(), r.retreats(), r.repairs(), r.picked(),
-                r.hitsTaken(), r.damageTaken());
+        return String.format(Locale.ROOT, "%s over (%s): %d killed, %d swings (%d cut short), %d guards (%d blocked), "
+                        + "%d heals, %d retreats, %d repairs, %d picked up, %d hits taken (%.0f damage).", what,
+                r.status(), r.kills(), r.swings(), r.cut(), r.guards(), r.blocked(), r.heals(), r.retreats(),
+                r.repairs(), r.picked(), r.hitsTaken(), r.damageTaken());
     }
 }

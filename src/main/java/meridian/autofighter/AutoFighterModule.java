@@ -22,15 +22,17 @@ import meridian.core.api.World;
 /**
  * meridian-auto-fighter: fights, with the player's own character or a headless one - Guard (whoever
  * attacks, taking the wheel from a job under way and giving it back after), Farm (mobs of a kind round
- * where it started, their drops picked up) and Escort (a player followed and defended). Whom to fight
- * and when to eat, block, back off or repair is decided here ({@link Fighter}); the walking, the hands
- * and the reading of the fight are core's. In the proxy's window: the Fight section. On the command
- * channel: {@code fight <conn> guard|farm|escort|stop|status|set ...}.
+ * where it started, their drops picked up) and Escort (a player followed and defended); and with no
+ * mode started, "Guard the miner and builder": a fight for core's jobs only, never taking the body from
+ * the player playing by hand. Whom to fight and when to eat, block, back off or repair is decided here
+ * ({@link Fighter}); the walking, the hands and the reading of the fight are core's. In the proxy's
+ * window: the Fight section, its choices kept across restarts. On the command channel:
+ * {@code fight <conn> guard|farm|escort|stop|status|set ...}.
  */
 public class AutoFighterModule implements ProxyModule {
 
     private static final String USAGE = "guard [radius] | farm <kind> [count, -1 no end] [radius] | escort <player> [distance]"
-            + " | stop | status | set heal|retreat <percent> | set block|repair|players|pickup on|off"
+            + " | stop | status | set heal|retreat <percent> | set block|repair|players|pickup|guardjobs|overpower on|off"
             + " | set hostile <kind,kind,...> | set radius <blocks>";
 
     /** What the Start button starts. */
@@ -65,7 +67,12 @@ public class AutoFighterModule implements ProxyModule {
     private volatile int retreatAt = 25;
     private volatile boolean block = true;
     private volatile boolean repair = true;
+    /** With no mode started, fight for core's jobs that have the body (the miner's, the builder's, a trip). */
+    private volatile boolean guardJobs = true;
+    /** Our swing runs to its end, the guard after - what the server lets through; off, the game's way. */
+    private volatile boolean overpower;
     private volatile String note = "";
+    private volatile Fighter running;
 
     @Override
     public void onEnable(ModuleContext ctx) {
@@ -80,6 +87,9 @@ public class AutoFighterModule implements ProxyModule {
                 ctx.services().get(Worker.class).orElse(null),
                 ctx.services().get(DebugRender.class).orElse(null),
                 ctx.offloadExecutor(), ctx.getLogger());
+        // The sentry fights by the panel as it is at each beat.
+        fighter.liveOptions(this::options);
+        running = fighter;
         try {
             ctx.registerCommand("fight", USAGE, (args, json) -> command(fighter, args));
         } catch (NoSuchMethodError olderProxy) {
@@ -107,9 +117,15 @@ public class AutoFighterModule implements ProxyModule {
                 .int_("fightHealAt", "Heal at health (%)", 0, 100, healAt, v -> healAt = v)
                 .int_("fightRetreatAt", "Back off at health (%)", 0, 100, retreatAt, v -> retreatAt = v)
                 .bool("fightBlock", "Block when the enemy swings", block, v -> block = v)
+                .bool("fightOverpower", "Overpower: my swing always lands, the guard after it", overpower,
+                        v -> overpower = v)
                 .bool("fightRepair", "Repair a worn weapon with a kit", repair, v -> repair = v)
                 .build();
         SettingsSpec.Builder spec = SettingsSpec.builder()
+                .bool("fightGuardJobs", "Guard the miner and builder (with no mode started)", guardJobs, v -> {
+                    guardJobs = v;
+                    fighter.guardJobs(v);
+                })
                 .enum_("fightMode", "Mode", ModeChoice.class, ModeChoice.GUARD, v -> choice = v)
                 .section("Targets", targets)
                 .section("Farm", farm)
@@ -122,12 +138,26 @@ public class AutoFighterModule implements ProxyModule {
                     fighter.stop();
                 })
                 .liveText("Fight", () -> note.isEmpty() ? fighter.status() : note);
+        // Kept across restarts, every choice of the panel: saved values come back through the same
+        // setters at the start.
+        spec.persistent("fightGuardJobs", "fightMode", "fightHostile", "fightPlayers", "fightRadius", "fightFarmKind",
+                "fightFarmCount", "fightFarmRadius", "fightPickUp", "fightEscortName", "fightEscortDistance",
+                "fightHealAt", "fightRetreatAt", "fightBlock", "fightOverpower", "fightRepair", "fightShowTarget");
         ctx.registerSettings(SettingsSpec.builder().section("Fight", spec.build()).build());
         ctx.getLogger().info("meridian-auto-fighter enabled");
     }
 
+    @Override
+    public void onDisable() {
+        Fighter f = running;
+        running = null;
+        if (f != null) {
+            f.shutdown();   // the sentry runs as long as the module: it ends with it
+        }
+    }
+
     private Fighter.Options options() {
-        return new Fighter.Options(hostile, players, radius, healAt, retreatAt, block, repair, pickUp);
+        return new Fighter.Options(hostile, players, radius, healAt, retreatAt, block, repair, pickUp, overpower);
     }
 
     /** Starts what the mode says; the Fight line says how it goes. */
@@ -169,7 +199,7 @@ public class AutoFighterModule implements ProxyModule {
                 });
             }
             case "set" -> {
-                return CompletableFuture.completedFuture(set(args));
+                return CompletableFuture.completedFuture(set(fighter, args));
             }
             case "guard" -> {
                 if (args.size() > 1) {
@@ -202,8 +232,11 @@ public class AutoFighterModule implements ProxyModule {
         }
     }
 
-    /** {@code set heal|retreat <percent> | set block|repair|players|pickup on|off | set hostile <a,b> | set radius <n>}. */
-    private Map<String, Object> set(List<String> args) {
+    /**
+     * {@code set heal|retreat <percent> | set block|repair|players|pickup|guardjobs|overpower on|off |
+     * set hostile <a,b> | set radius <n>}.
+     */
+    private Map<String, Object> set(Fighter fighter, List<String> args) {
         String what = args.size() > 1 ? args.get(1).toLowerCase(Locale.ROOT) : "";
         String value = args.size() > 2 ? args.get(2) : "";
         boolean on = value.equalsIgnoreCase("on") || value.equalsIgnoreCase("true");
@@ -214,6 +247,11 @@ public class AutoFighterModule implements ProxyModule {
             case "repair" -> repair = on;
             case "players" -> players = on;
             case "pickup" -> pickUp = on;
+            case "overpower" -> overpower = on;
+            case "guardjobs" -> {
+                guardJobs = on;
+                fighter.guardJobs(on);
+            }
             case "radius" -> radius = Integer.parseInt(value);
             case "hostile" -> {
                 List<String> kinds = new ArrayList<>();
@@ -233,6 +271,8 @@ public class AutoFighterModule implements ProxyModule {
         out.put("repair", repair);
         out.put("players", players);
         out.put("pickup", pickUp);
+        out.put("overpower", overpower);
+        out.put("guardJobs", guardJobs);
         out.put("radius", radius);
         out.put("hostile", hostile);
         return out;
