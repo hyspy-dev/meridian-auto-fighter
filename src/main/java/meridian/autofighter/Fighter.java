@@ -133,6 +133,16 @@ final class Fighter {
     static final long RETREAT_COOLDOWN_MS = 8000;
     /** A player who takes the body back in a Guard fight is left to it for this long. */
     static final long PLAYER_TOOK_MS = 10_000;
+    /**
+     * An enemy the body cannot get at - no way to it, or a chase that drags on - is left alone this
+     * long, unless it hits us: a mob behind a wall would otherwise take the body from a job, lead it
+     * off, give it back, and take it again as soon as the job came back near it.
+     */
+    static final long PASS_MS = 20_000;
+    /** A chase this long without the target in reach is given up: the way to it goes round too far. */
+    static final long CHASE_GIVE_UP_MS = 15_000;
+    /** It hit us this lately: an enemy even if left alone, out of sight or out of reach. */
+    static final Duration HIT_NOW = Duration.ofSeconds(3);
     /** A sentry with no job to guard looks again this often. */
     static final long SENTRY_IDLE_MS = 200;
     /** Farm: with nothing of the kind about for this long, the job is over. */
@@ -388,6 +398,11 @@ final class Fighter {
         int slotBefore = -1;
         CompletableFuture<NavResult> chase;
         int chased = -1;
+        /** The target the chase began after, and when: a new target starts the clock again. */
+        int chaseFor = -1;
+        long chaseSince;
+        /** Enemies left alone (see {@link #PASS_MS}), until when. */
+        final Map<Integer, Long> passed = new HashMap<>();
         /** When we last hit each entity - a kill is ours if it falls soon after. */
         final Map<Integer, Long> struck = new HashMap<>();
         /** The attack (chain) each entity was last guarded against, so one attack takes one guard. */
@@ -573,6 +588,11 @@ final class Fighter {
         List<Integer> enemies = enemies(j, me, j.options().radius(), me);
         if (enemies.isEmpty()) {
             if (j.fighting) {
+                if (j.target >= 0 && alive(j.target)) {
+                    // Gone out of the radius alive - away, or the chase led the body off: not taken up
+                    // again the moment the job brings the body back near it.
+                    pass(j, j.target, "out of the radius alive");
+                }
                 endFight(j);
             }
             status = who + ": no enemy about.";
@@ -728,6 +748,16 @@ final class Fighter {
                 enemy = j.options().players() && (hitUs || swung);
             } else {
                 enemy = hitUs || swung || (fromCenter <= radius && hostileKind(id, j.options().hostile()));
+            }
+            if (enemy && !(combat != null && combat.hitBy(id, HIT_NOW))) {
+                // Not hitting us now: one left alone stays so, and one by its kind or its swing only is
+                // an enemy when the eyes see it - a mob behind a wall is no threat to the job.
+                Long until = j.passed.get(id);
+                if (until != null && until > System.currentTimeMillis()) {
+                    enemy = false;
+                } else if (!hitUs && !(swung && j.mode == Mode.ESCORT) && !sees(id, at)) {
+                    enemy = false;
+                }
             }
             if (enemy && fromCenter <= radius + LEASH) {
                 out.add(id);
@@ -913,6 +943,24 @@ final class Fighter {
         if (left < 0) {
             status = String.format(Locale.ROOT, "Fighting %s: going after it, %.1f to go.", entities.labelOf(target), -left);
             double reach = reachOf(held);
+            if (j.chaseFor != target) {
+                j.chaseFor = target;
+                j.chaseSince = System.currentTimeMillis();
+            }
+            if (!(combat != null && combat.hitBy(target, HIT_NOW))) {
+                NavResult r = j.chased == target && j.chase != null && j.chase.isDone() && !j.chase.isCancelled()
+                        ? j.chase.getNow(null) : null;
+                boolean noWay = r != null && (r.status() == NavResult.Status.NO_PATH
+                        || r.status() == NavResult.Status.BLOCKED);
+                if (noWay || System.currentTimeMillis() - j.chaseSince > CHASE_GIVE_UP_MS) {
+                    pass(j, target, noWay ? "no way to it (" + r.status() + ")" : "the chase drags on");
+                    stopChase(j);
+                    unmark();
+                    j.target = -1;
+                    j.chaseFor = -1;
+                    return;
+                }
+            }
             if (j.chase == null || j.chase.isDone() || j.chased != target) {
                 stopChase(j);
                 j.chased = target;
@@ -921,6 +969,7 @@ final class Fighter {
             return;
         }
         stopChase(j);
+        j.chaseFor = -1;
         Vec3 aim = aimAt(target, at);
         try {
             movement.face(aim, Math.toRadians(6)).get(250, TimeUnit.MILLISECONDS);
@@ -1410,6 +1459,63 @@ final class Fighter {
     // ------------------------------------------------------------------
     // Bits
     // ------------------------------------------------------------------
+
+    /** Leaves an enemy alone a while ({@link #PASS_MS}). */
+    private void pass(Job j, int id, String why) {
+        long now = System.currentTimeMillis();
+        j.passed.values().removeIf(t -> t < now);
+        j.passed.put(id, now + PASS_MS);
+        log.info("auto-fighter: {} ({}) left alone for {} s: {}", entities.labelOf(id), id, PASS_MS / 1000, why);
+    }
+
+    /**
+     * Whether the eyes see the entity: a line from them to its middle, or to its head, that no solid
+     * block cuts. A block not known (not loaded) does not cut it.
+     */
+    private boolean sees(int id, Vec3 at) {
+        Vec3 eyes = eyes();
+        if (eyes == null) {
+            return true;
+        }
+        Box b = entities.boundsOf(id).orElse(null);
+        double low = b == null ? at.y() + 0.9 : (b.min().y() + b.max().y()) / 2;
+        double high = b == null ? at.y() + 1.6 : b.max().y() - 0.15;
+        return clear(eyes, new Vec3(at.x(), low, at.z())) || clear(eyes, new Vec3(at.x(), high, at.z()));
+    }
+
+    /** No solid block between {@code a} and {@code b}, the cell {@code b} is in left out. */
+    private boolean clear(Vec3 a, Vec3 b) {
+        double dx = b.x() - a.x();
+        double dy = b.y() - a.y();
+        double dz = b.z() - a.z();
+        int steps = Math.max(1, (int) Math.ceil(Math.sqrt(dx * dx + dy * dy + dz * dz) / 0.1));
+        int ex = (int) Math.floor(b.x());
+        int ey = (int) Math.floor(b.y());
+        int ez = (int) Math.floor(b.z());
+        int lx = Integer.MIN_VALUE;
+        int ly = Integer.MIN_VALUE;
+        int lz = Integer.MIN_VALUE;
+        for (int i = 1; i < steps; i++) {
+            double t = (double) i / steps;
+            int x = (int) Math.floor(a.x() + dx * t);
+            int y = (int) Math.floor(a.y() + dy * t);
+            int z = (int) Math.floor(a.z() + dz * t);
+            if (x == lx && y == ly && z == lz) {
+                continue;
+            }
+            lx = x;
+            ly = y;
+            lz = z;
+            if (x == ex && y == ey && z == ez) {
+                break;
+            }
+            meridian.core.api.Block blk = world.blockAt(x, y, z);
+            if (blk != null && blk.type() != null && !blk.isAir() && blk.type().isSolid()) {
+                return false;
+            }
+        }
+        return true;
+    }
 
     private void stopChase(Job j) {
         CompletableFuture<NavResult> c = j.chase;
