@@ -48,7 +48,8 @@ import org.slf4j.Logger;
  *   <li><b>Escort</b> holds the body, follows a player and fights what threatens them.</li>
  * </ul>
  *
- * <p>A fight is melee: the hotbar's best weapon ({@link Player#bestWeaponSlot}), the body taken to
+ * <p>Beyond the configured distance an ordinary bow is used when core offers its ranged service
+ * and ammunition is available. Core owns the draw, lead and flight. At close range: the hotbar's best weapon ({@link Player#bestWeaponSlot}), the body taken to
  * within its reach ({@link Navigator#chase}), the head to the target, a guard raised when the target
  * begins an attack ({@link Combat#swingOf}), else a swing ({@link InteractionControl#hitEntity}).
  * The server keeps the rhythm and the stamina; a refused swing is just the next beat. Below the heal
@@ -79,11 +80,11 @@ final class Fighter {
      *                  game does ({@link InteractionControl#useItem(Duration, boolean)})
      */
     record Options(List<String> hostile, boolean players, double radius, int healAt, int retreatAt, boolean block,
-                   boolean repair, boolean pickUp, boolean overpower) {
+                   boolean repair, boolean pickUp, boolean overpower, boolean bow, double bowDistance) {
 
         static final List<String> HOSTILE = List.of("Zombie", "Skeleton", "Spider", "Goblin", "Trork", "Scarak",
                 "Wraith", "Void", "Ghoul", "Outlander");
-        static final Options DEFAULT = new Options(HOSTILE, false, 12, 50, 25, true, true, true, false);
+        static final Options DEFAULT = new Options(HOSTILE, false, 12, 50, 25, true, true, true, false, true, 6);
     }
 
     /** What a job did. */
@@ -153,6 +154,9 @@ final class Fighter {
     static final long DROPS_WAIT_MS = 3500;
     /** The id of the box that outlines the target ({@link DebugRender#worldBox}). */
     static final String TARGET_BOX = "meridian-auto-fighter:target";
+
+    private BowSupport bows = BowSupport.NONE;
+    void bows(BowSupport support) { bows = support; }
 
     private final Movement movement;
     private final Navigator navigator;
@@ -328,6 +332,7 @@ final class Fighter {
      * after it while "Guard the miner and builder" is on.
      */
     synchronized CompletableFuture<Result> stop() {
+        bows.cancel();
         job.incrementAndGet();
         return running.handle((r, e) -> r);
     }
@@ -937,6 +942,20 @@ final class Fighter {
             heal(j, healSlot);
             return;
         }
+        if (j.options().bow() && me.distanceSqTo(at) > j.options().bowDistance() * j.options().bowDistance()
+                && bows.slot() >= 0) {
+            stopChase(j);
+            movement.stop();
+            status = "Fighting " + entities.labelOf(target) + ": drawing bow.";
+            BowSupport.Shot shot = bows.shoot(target).get(35, TimeUnit.SECONDS);
+            if (shot.sent()) {
+                j.swings++;
+                j.struck.put(target, System.currentTimeMillis());
+                log.info("meridian-auto-fighter: bow at {}: {}", target, shot.reason());
+                return;
+            }
+            // A wall, unknown trajectory or missing ammo: approach with the melee weapon.
+        }
         arm(j);
         String held = world.player().map(Player::heldItem).orElse(null);
         double left = reachLeft(target);
@@ -1026,6 +1045,7 @@ final class Fighter {
      * A beat would only see the attack after that swing too, and later.
      */
     private void guardAgainst(Job j, Combat.Swing w) {
+        if (world.player().map(Player::heldItem).orElse("").startsWith("Weapon_Shortbow_")) return;
         if (!j.options().block() || j.target < 0 || job.get() != j.id) {
             return;
         }

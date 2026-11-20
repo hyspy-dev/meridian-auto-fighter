@@ -33,7 +33,7 @@ public class AutoFighterModule implements ProxyModule {
 
     private static final String USAGE = "guard [radius] | farm <kind> [count, -1 no end] [radius] | escort <player> [distance]"
             + " | stop | status | set heal|retreat <percent> | set block|repair|players|pickup|guardjobs|overpower on|off"
-            + " | set hostile <kind,kind,...> | set radius <blocks>";
+            + " | set hostile <kind,kind,...> | set radius <blocks> | set bow on|off | set bowdistance <blocks>";
 
     /** What the Start button starts. */
     enum ModeChoice {
@@ -71,11 +71,14 @@ public class AutoFighterModule implements ProxyModule {
     private volatile boolean guardJobs = true;
     /** Our swing runs to its end, the guard after - what the server lets through; off, the game's way. */
     private volatile boolean overpower;
+    private volatile boolean bow = true;
+    private volatile int bowDistance = 6;
     private volatile String note = "";
     private volatile Fighter running;
 
     @Override
     public void onEnable(ModuleContext ctx) {
+        adoptOldData(ctx, "meridian-auto-fighter");
         Fighter fighter = new Fighter(
                 ctx.services().require(Movement.class),
                 ctx.services().require(Navigator.class),
@@ -87,6 +90,8 @@ public class AutoFighterModule implements ProxyModule {
                 ctx.services().get(Worker.class).orElse(null),
                 ctx.services().get(DebugRender.class).orElse(null),
                 ctx.offloadExecutor(), ctx.getLogger());
+        try { fighter.bows(BowBridge.connect(ctx)); }
+        catch (LinkageError olderCore) { fighter.bows(BowSupport.NONE); }
         // The sentry fights by the panel as it is at each beat.
         fighter.liveOptions(this::options);
         running = fighter;
@@ -113,6 +118,10 @@ public class AutoFighterModule implements ProxyModule {
                         v -> escortName = v == null ? "" : v.trim())
                 .int_("fightEscortDistance", "Keep within (blocks)", 1, 16, escortDistance, v -> escortDistance = v)
                 .build();
+        SettingsSpec ranged = SettingsSpec.builder()
+                .bool("fightBow", "Use bow at distance", bow, v -> bow = v)
+                .int_("fightBowDistance", "Switch to bow beyond (blocks)", 3, 64, bowDistance, v -> bowDistance = v)
+                .build();
         SettingsSpec survival = SettingsSpec.builder()
                 .int_("fightHealAt", "Heal at health (%)", 0, 100, healAt, v -> healAt = v)
                 .int_("fightRetreatAt", "Back off at health (%)", 0, 100, retreatAt, v -> retreatAt = v)
@@ -131,6 +140,7 @@ public class AutoFighterModule implements ProxyModule {
                 .section("Farm", farm)
                 .section("Escort", escort)
                 .section("Survival", survival)
+                .section("Bow", ranged)
                 .bool("fightShowTarget", "Outline the target", true, fighter::showTarget)
                 .button("Start", () -> start(fighter))
                 .button("Stop", () -> {
@@ -142,7 +152,7 @@ public class AutoFighterModule implements ProxyModule {
         // setters at the start.
         spec.persistent("fightGuardJobs", "fightMode", "fightHostile", "fightPlayers", "fightRadius", "fightFarmKind",
                 "fightFarmCount", "fightFarmRadius", "fightPickUp", "fightEscortName", "fightEscortDistance",
-                "fightHealAt", "fightRetreatAt", "fightBlock", "fightOverpower", "fightRepair", "fightShowTarget");
+                "fightBow", "fightBowDistance", "fightHealAt", "fightRetreatAt", "fightBlock", "fightOverpower", "fightRepair", "fightShowTarget");
         ctx.registerSettings(SettingsSpec.builder().section("Fight", spec.build()).build());
         ctx.getLogger().info("meridian-auto-fighter enabled");
     }
@@ -157,7 +167,7 @@ public class AutoFighterModule implements ProxyModule {
     }
 
     private Fighter.Options options() {
-        return new Fighter.Options(hostile, players, radius, healAt, retreatAt, block, repair, pickUp, overpower);
+        return new Fighter.Options(hostile, players, radius, healAt, retreatAt, block, repair, pickUp, overpower, bow, bowDistance);
     }
 
     /** Starts what the mode says; the Fight line says how it goes. */
@@ -248,6 +258,8 @@ public class AutoFighterModule implements ProxyModule {
             case "players" -> players = on;
             case "pickup" -> pickUp = on;
             case "overpower" -> overpower = on;
+            case "bow" -> bow = on;
+            case "bowdistance" -> bowDistance = Math.max(3, Math.min(64, Integer.parseInt(value)));
             case "guardjobs" -> {
                 guardJobs = on;
                 fighter.guardJobs(on);
@@ -272,9 +284,43 @@ public class AutoFighterModule implements ProxyModule {
         out.put("players", players);
         out.put("pickup", pickUp);
         out.put("overpower", overpower);
+        out.put("bow", bow);
+        out.put("bowDistance", bowDistance);
         out.put("guardJobs", guardJobs);
         out.put("radius", radius);
         out.put("hostile", hostile);
         return out;
+    }
+
+    /**
+     * The module was named "meridian-auto-fighter" before it took the family's name ("Meridian Auto Fighter"); the proxy keeps a module's
+     * data under its name, so the old folder's files (the panel's settings and all) move over once.
+     * A file already in the new folder is kept.
+     */
+    static void adoptOldData(ModuleContext ctx, String oldName) {
+        try {
+            java.nio.file.Path now = ctx.getDataDir();
+            java.nio.file.Path oldDir = now.getParent().getParent().resolve(oldName);
+            java.nio.file.Path old = oldDir.resolve("data");
+            if (!java.nio.file.Files.isDirectory(old)) {
+                return;
+            }
+            int moved = 0;
+            try (var files = java.nio.file.Files.list(old)) {
+                for (java.nio.file.Path f : files.toList()) {
+                    java.nio.file.Path to = now.resolve(f.getFileName());
+                    if (!java.nio.file.Files.exists(to)) {
+                        java.nio.file.Files.move(f, to);
+                        moved++;
+                    }
+                }
+            }
+            try { java.nio.file.Files.delete(old); java.nio.file.Files.delete(oldDir); } catch (java.io.IOException notEmpty) { }
+            if (moved > 0) {
+                org.slf4j.LoggerFactory.getLogger("meridian-auto-fighter").info("auto-fighter: {} file(s) moved over from the old folder {}", moved, oldDir);
+            }
+        } catch (java.io.IOException | RuntimeException e) {
+            org.slf4j.LoggerFactory.getLogger("meridian-auto-fighter").warn("auto-fighter: the old folder's data could not be moved over: {}", e.toString());
+        }
     }
 }
