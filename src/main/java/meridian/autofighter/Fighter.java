@@ -193,6 +193,10 @@ final class Fighter {
     /** The job under way; a new one, or a stop, moves it on. */
     private final AtomicInteger job = new AtomicInteger();
     private volatile CompletableFuture<Result> running = CompletableFuture.completedFuture(null);
+    /** Offloaded jobs must finish before the module's class loader can be closed. */
+    private final Set<CompletableFuture<Void>> jobs = new HashSet<>();
+    private final Set<Thread> jobThreads = new HashSet<>();
+    private boolean closed;
     private volatile Mode mode = Mode.OFF;
     private volatile String status = "Off.";
     private volatile Job current;
@@ -235,6 +239,9 @@ final class Fighter {
      * the body - never taking it from the player playing by hand; off, it is stopped.
      */
     synchronized void guardJobs(boolean on) {
+        if (closed) {
+            return;
+        }
         guardJobs = on;
         if (on && mode == Mode.OFF) {
             sentry();
@@ -248,9 +255,27 @@ final class Fighter {
     }
 
     /** The module is going: whatever runs stops, and the sentry is not started again. */
-    synchronized void shutdown() {
-        guardJobs = false;
-        job.incrementAndGet();
+    void shutdown() {
+        CompletableFuture<?>[] ending;
+        synchronized (this) {
+            closed = true;
+            guardJobs = false;
+            job.incrementAndGet();
+            ending = jobs.toArray(CompletableFuture<?>[]::new);
+            jobThreads.forEach(Thread::interrupt);
+        }
+        bows.cancel();
+        // Do not hold the monitor: each job's finally needs it to give the body back. Bounded: a
+        // job stuck on something that ignores the interrupt must not hang the proxy's unload.
+        try {
+            CompletableFuture.allOf(ending).get(10, java.util.concurrent.TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } catch (java.util.concurrent.TimeoutException e) {
+            log.warn("auto-fighter: a job did not end within 10 s of the module going - unloaded without it");
+        } catch (java.util.concurrent.ExecutionException e) {
+            // the jobs' futures only ever complete normally
+        }
     }
 
     /** Starts the sentry. Called with the monitor held, when no mode runs. */
@@ -338,11 +363,21 @@ final class Fighter {
     }
 
     private synchronized CompletableFuture<Result> start(Job j) {
+        if (closed) {
+            return CompletableFuture.failedFuture(new IllegalStateException("fighter is shut down"));
+        }
         CompletableFuture<Result> before = running;
         CompletableFuture<Result> done = new CompletableFuture<>();
+        CompletableFuture<Void> exited = new CompletableFuture<>();
+        jobs.add(exited);
         running = done;
         mode = j.mode;
         executor.execute(() -> {
+            synchronized (this) {
+                jobThreads.add(Thread.currentThread());
+                // The task may have been queued, but not started, when shutdown took its snapshot.
+                if (closed) Thread.currentThread().interrupt();
+            }
             Result r = null;
             try {
                 try {
@@ -360,7 +395,15 @@ final class Fighter {
                 status = "Failed: " + t;
                 done.completeExceptionally(t);
             } finally {
-                over(done, j, r);
+                try {
+                    over(done, j, r);
+                } finally {
+                    synchronized (this) {
+                        jobThreads.remove(Thread.currentThread());
+                        jobs.remove(exited);
+                        exited.complete(null);
+                    }
+                }
             }
         });
         return done;
