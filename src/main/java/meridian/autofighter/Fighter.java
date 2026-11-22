@@ -186,6 +186,33 @@ final class Fighter {
     static final double OUTRUN = 4.5;
     /** Nearer than this there is no drawing a bow. */
     static final double BOW_NEAR = 3.0;
+    /** How far past a blast's reach the body gets, to be out of it. */
+    static final double BLAST_MARGIN = 1.0;
+    /** A bomb not told of anew for this long lies where it is: the server tells only what moves. */
+    static final long BOMB_LYING_NS = 200_000_000L;
+    /** How near the place out of a blast the body has to get. */
+    static final double DODGE_GOAL = 0.5;
+    /**
+     * A blast taking less than this share of the body's whole health is stood: the owner's word, 22.11,
+     * the bow first - a lobber close by throws its small bombs (five points, 0.6) a second apart, and a
+     * body getting out of each never drew the bow once in three minutes.
+     */
+    static final double BLAST_WORTH = 0.10;
+    /** ...unless it takes this share of what health is left. */
+    static final double BLAST_WORTH_LEFT = 0.25;
+    /**
+     * What running along a flying bomb's way costs, in blocks, against running across it: a bomb goes
+     * off on whom it hits, at once - a body backing off along its line was hit 0.9 s after the throw.
+     */
+    static final double ALONG_ITS_WAY = 3.0;
+    /** A bomb moving faster than this over the ground is in the air: it comes down further along its way. */
+    static final double BOMB_FLYING = 1.5;
+    /** How far along a flying bomb's way its coming down is looked for. */
+    static final double BOMB_AHEAD = 16.0;
+    /** A blast point that has moved this far - the bomb bounced, rolled - is got out of anew. */
+    static final double BLAST_MOVED = 1.5;
+    /** A shot the bow had no flight for is tried again once the body or the enemy has moved this far. */
+    static final double SHOT_AGAIN = 2.0;
     /** A player who takes the body back in a Guard fight is left to it for this long. */
     static final long PLAYER_TOOK_MS = 10_000;
     /**
@@ -194,8 +221,14 @@ final class Fighter {
      * off, give it back, and take it again as soon as the job came back near it.
      */
     static final long PASS_MS = 20_000;
-    /** A chase this long without the target in reach is given up: the way to it goes round too far. */
-    static final long CHASE_GIVE_UP_MS = 15_000;
+    /**
+     * A chase is given up once the body has run this far and is no nearer an enemy that has itself
+     * moved half as far: it keeps away, and would lead the body off for as long as it likes. One that
+     * stands where it stood is gone to however long the way round is - that chase ends by getting
+     * there or by there being no way (the owner's run of 22.11: a mage twelve blocks down in the pit,
+     * shot twice from the rim and then "left alone" - an enemy is finished off). No clock in it.
+     */
+    static final double CHASE_RUN = 24.0;
     /** It hit us this lately: an enemy even if left alone, out of sight or out of reach. */
     static final Duration HIT_NOW = Duration.ofSeconds(3);
     /** A sentry with no job to guard looks again this often. */
@@ -360,6 +393,8 @@ final class Fighter {
             out.put("resting", j.resting);
             out.put("retreating", j.retreating);
             out.put("fleeing", j.fleeFrom >= 0);
+            out.put("dodging", j.dodging);
+            out.put("dodges", j.dodges);
             out.put("flights", j.flights);
             out.putAll(counts(j.result("RUNNING")));
         }
@@ -505,9 +540,15 @@ final class Fighter {
         int slotBefore = -1;
         CompletableFuture<NavResult> chase;
         int chased = -1;
-        /** The target the chase began after, and when: a new target starts the clock again. */
+        /**
+         * The target the chase began after; how far off it was then and where it stood; how far the
+         * body has run since, and where it was a beat ago. A new target starts them again.
+         */
         int chaseFor = -1;
-        long chaseSince;
+        double chaseGap;
+        Vec3 chaseTargetFrom;
+        double chaseRun;
+        Vec3 chaseAt;
         /** Enemies left alone (see {@link #PASS_MS}), until when. */
         final Map<Integer, Long> passed = new HashMap<>();
         /** When we last hit each entity - a kill is ours if it falls soon after. */
@@ -542,6 +583,29 @@ final class Fighter {
         Vec3 noRoomAt;
         /** Why the last shot was not made: said once, not every beat. */
         String noShot;
+        /**
+         * Enemies the bow had no flight to, and where the body and the enemy stood then: no shot is
+         * tried again from there - the body comes nearer instead - until one of the two has moved
+         * {@link #SHOT_AGAIN}.
+         */
+        final Map<Integer, Vec3[]> noShotFrom = new HashMap<>();
+        /**
+         * Enemies that attack from afar and could not be shot from afar: fought as any other from
+         * then on - the bow where a shot opens, the sword in reach - not kept at a distance.
+         */
+        final Set<Integer> closedInOn = new HashSet<>();
+        /**
+         * Getting out of a bomb's blast ({@link #dodge}): where it will go off, the places being tried
+         * and the trip to one; no place left to try.
+         */
+        boolean dodging;
+        Vec3 dodgeFrom;
+        final java.util.ArrayDeque<Goal> dodgeTo = new java.util.ArrayDeque<>();
+        CompletableFuture<NavResult> dodgeTrip;
+        /** The place {@link #dodgeTrip} goes to. */
+        Goal dodgeGoal;
+        boolean noWayOut;
+        int dodges;
         /** Running from this enemy ({@link #flee}); {@code -1} when from none. */
         int fleeFrom = -1;
         /** The places the leg of the run under way tries, and its trip; how far the enemy was when it began. */
@@ -695,6 +759,7 @@ final class Fighter {
             stopRetreat(j);
             stopFlee(j);
             stopStandOff(j);
+            stopDodge(j);
             unmark();
             if (j.fighting) {
                 endFight(j);
@@ -730,6 +795,10 @@ final class Fighter {
         Vec3 me = movement.position();
         if (me == null) {
             status = who + ": the player is nowhere yet.";
+            return null;
+        }
+        // A bomb's blast first: out of it, whatever else the beat would have been.
+        if (j.lost == null && System.currentTimeMillis() >= j.playerTookUntil && dodge(j, me)) {
             return null;
         }
         List<Integer> enemies = enemies(j, me, j.options().radius(), me);
@@ -796,6 +865,9 @@ final class Fighter {
         Vec3 me = movement.position();
         if (me == null) {
             return "NOT_AVAILABLE";
+        }
+        if (dodge(j, me)) {
+            return null;        // a bomb's blast first
         }
         List<Integer> enemies = enemies(j, me, j.options().radius(), me);
         List<Integer> prey = new ArrayList<>();
@@ -891,7 +963,8 @@ final class Fighter {
         OptionalInt self = entities.localEntityId();
         List<Integer> out = new ArrayList<>();
         for (int id : entities.trackedEntities()) {
-            if (self.isPresent() && self.getAsInt() == id || entities.itemOf(id).isPresent() || !alive(id)) {
+            if (self.isPresent() && self.getAsInt() == id || entities.itemOf(id).isPresent() || !alive(id)
+                    || !living(id)) {
                 continue;
             }
             if (j.mode == Mode.ESCORT && id == escorted(j.escorted)) {
@@ -1011,6 +1084,17 @@ final class Fighter {
         return model != null && model.toLowerCase(Locale.ROOT).contains(kind.trim().toLowerCase(Locale.ROOT));
     }
 
+    /**
+     * A living thing: the server tells its health. What is thrown - a goblin's bomb, an arrow in flight
+     * - has none, whatever its model is called: no enemy, nothing to fight and nothing to run at. The
+     * owner's run of 22.11: {@code Bomb_Fire_Goblin} was "a goblin" by its name, the body ran up to
+     * each bomb the lobber threw to put the sword to it, and stood in every blast.
+     */
+    private boolean living(int id) {
+        Optional<EntityTracker.Stat> h = entities.healthOf(id);
+        return h.isPresent() && h.get().max() > h.get().min();
+    }
+
     /** Alive: in sight, and its health - where it is known - above its min. */
     private boolean alive(int id) {
         if (entities.positionOf(id).isEmpty()) {
@@ -1122,6 +1206,7 @@ final class Fighter {
         stopRetreat(j);
         stopFlee(j);
         stopStandOff(j);
+        stopDodge(j);
         j.retreated = false;
         unmark();
         j.target = -1;
@@ -1249,10 +1334,21 @@ final class Fighter {
         if (j.noRoom == target && j.noRoomAt != null && dist(me, j.noRoomAt) > 4) {
             j.noRoom = -1;      // the body is elsewhere now: there may be room again
         }
-        // Kept off: it reaches far, there is a bow, and room to step back in. With no room it is
-        // fought as any other - the bow from afar, the sword once it is near: no other way is left.
-        boolean ranged = bowAtHand && foe != null && foe.attackDistance() > RANGED && j.noRoom != target;
-        if (ranged && !j.standingOff && far < foe.attackDistance() + STANDOFF
+        // Kept off: it reaches far, there is a bow, and room to step back in. With no room - or no
+        // shot at it from afar - it is fought as any other: the bow where a shot opens, the sword once
+        // it is near: no other way is left.
+        boolean ranged = bowAtHand && foe != null && foe.attackDistance() > RANGED && j.noRoom != target
+                && !j.closedInOn.contains(target);
+        // The bow had no flight to it from here: not asked again until here or there is another place
+        // - and the eyes have it again: the body is not stopped every two blocks of the way round a
+        // wall to ask a bow that cannot see.
+        Vec3[] refused = j.noShotFrom.get(target);
+        boolean noShotHere = refused != null && ((dist(me, refused[0]) < SHOT_AGAIN && dist(at, refused[1]) < SHOT_AGAIN)
+                || !sees(target, at));
+        // One that throws bombs is not stepped back from: its bombs are got out of ({@link #dodge}), and
+        // the time between them is the bow's (the owner's word, 22.11: "no need to keep farther off, but
+        // the bow first" - stepping back after each blast, the body shot five arrows in a minute).
+        if (ranged && !j.standingOff && !throwers.contains(target) && far < foe.attackDistance() + STANDOFF
                 && foe.maxSpeed() > 0 && foe.maxSpeed() < OUTRUN) {
             // Within what it reaches, and it is slow: back first, out of it.
             Vec3 from = at;
@@ -1277,18 +1373,22 @@ final class Fighter {
                 return;
             }
         }
-        if (bowAtHand && (ranged ? far > BOW_NEAR : far > j.options().bowDistance())) {
+        if (bowAtHand && !noShotHere && (ranged ? far > BOW_NEAR : far > j.options().bowDistance())) {
             stopChase(j);
             movement.stop();
             status = "Fighting " + entities.labelOf(target) + ": drawing bow.";
-            // One kept off is slow, and there is time: the bow's full draw. The shortest one that reaches
-            // takes a few points of a goblin's hundred and sixty, and the lane ends before the goblin does.
-            BowSupport.Shot shot = bows.shoot(target, ranged).get(35, TimeUnit.SECONDS);
+            // The bow's full draw, always (the owner's word, 22.11: "the difference in the attack is
+            // great" - 29 an arrow against the shortest draw's 3).
+            BowSupport.Shot shot = drawn(bows.shoot(target, true));
+            if (shot == null) {
+                return;         // the draw given up for a bomb on its way: the next beat gets out of its blast
+            }
             if (shot.sent()) {
                 j.swings++;
                 j.struck.put(target, System.currentTimeMillis());
                 j.chaseFor = -1;
                 j.noShot = null;
+                j.noShotFrom.remove(target);
                 log.info("meridian-auto-fighter: bow at {}: {}", target, shot.reason());
                 return;
             }
@@ -1296,16 +1396,23 @@ final class Fighter {
                 j.noShot = shot.reason();
                 log.info("meridian-auto-fighter: no shot at {}: {}", target, shot.reason());
             }
-            if (ranged && bows.slot() >= 0) {
-                // One that reaches far is not run at because a shot was not made. No line to it, no
-                // flight that gets there: it is left be (and is an enemy again the moment it comes).
-                // Anything else - the bow busy, the body still moving - is over by the next beat.
-                if (shot.reason().startsWith("UNREACHABLE") || shot.reason().startsWith("UNKNOWN_TARGET")) {
-                    pass(j, target, "no shot at it: " + shot.reason());
-                    j.target = -1;
-                    unmark();
-                }
+            boolean noFlight = shot.reason().startsWith("UNREACHABLE") || shot.reason().startsWith("UNKNOWN_TARGET");
+            if (!noFlight && ranged && bows.slot() >= 0) {
+                // The bow busy, the body still moving: over by the next beat. One that reaches far is
+                // not run at because one shot was not made.
                 return;
+            }
+            if (noFlight) {
+                // No line to it, no flight that gets there from here: nearer, for a shot or for the
+                // sword. One that attacks from afar is not left be for that (the owner's run of 22.11:
+                // a lobber on a ledge nine blocks up, "left alone", threw bomb after bomb down at the
+                // body) - from now on it is fought as any other.
+                j.noShotFrom.put(target, new Vec3[] {me, at});
+                if (ranged) {
+                    j.closedInOn.add(target);
+                    stopStandOff(j);
+                    log.info("auto-fighter: no shot at {} ({}) from here - closing in on it", entities.labelOf(target), target);
+                }
             }
             // A wall, unknown trajectory or missing ammo: approach with the melee weapon.
         }
@@ -1317,15 +1424,28 @@ final class Fighter {
             double reach = reachOf(held);
             if (j.chaseFor != target) {
                 j.chaseFor = target;
-                j.chaseSince = System.currentTimeMillis();
+                j.chaseGap = far;
+                j.chaseTargetFrom = at;
+                j.chaseRun = 0;
+                j.chaseAt = me;
             }
+            j.chaseRun += dist(me, j.chaseAt);
+            j.chaseAt = me;
+            if (far < j.chaseGap - 1.0) {
+                // Nearer: the chase is getting somewhere - reckoned anew from here.
+                j.chaseGap = far;
+                j.chaseTargetFrom = at;
+                j.chaseRun = 0;
+            }
+            boolean keepsAway = j.chaseRun >= CHASE_RUN && dist(at, j.chaseTargetFrom) >= CHASE_RUN / 2;
             if (!(combat != null && combat.hitBy(target, HIT_NOW))) {
                 NavResult r = j.chased == target && j.chase != null && j.chase.isDone() && !j.chase.isCancelled()
                         ? j.chase.getNow(null) : null;
                 boolean noWay = r != null && (r.status() == NavResult.Status.NO_PATH
                         || r.status() == NavResult.Status.BLOCKED);
-                if (noWay || System.currentTimeMillis() - j.chaseSince > CHASE_GIVE_UP_MS) {
-                    pass(j, target, noWay ? "no way to it (" + r.status() + ")" : "the chase drags on");
+                if (noWay || keepsAway) {
+                    pass(j, target, noWay ? "no way to it (" + r.status() + ")"
+                            : String.format(Locale.ROOT, "it keeps away - no nearer after %.0f blocks of chase", j.chaseRun));
                     stopChase(j);
                     unmark();
                     j.target = -1;
@@ -1444,6 +1564,9 @@ final class Fighter {
 
     /** The target is down or gone: a kill when we hit it lately; its drops looked for in Farm. */
     private void gone(Job j, int target) throws Exception {
+        j.noShotFrom.remove(target);
+        j.closedInOn.remove(target);
+        throwers.remove(target);
         Long hit = j.struck.remove(target);
         Vec3 where = j.lastAt.remove(target);
         boolean ours = hit != null && System.currentTimeMillis() - hit < KILL_CREDIT_MS;
@@ -1856,6 +1979,287 @@ final class Fighter {
                     into.add(new Goal(cx, y, cz, 1));
                 }
             }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // A bomb's blast (the owner's word, 22.11: "get out of the blast's radius - the best of them")
+    // ------------------------------------------------------------------
+
+    /**
+     * A blast the body stands in, or will.
+     *
+     * @param id    the bomb
+     * @param at    where it will go off: where it lies - or, in the air, the point of its way nearest the body
+     * @param reach how far from there the body is to be: the blast's radius and {@link #BLAST_MARGIN}
+     * @param off   how far the body is from there now
+     * @param also  in the air: where it was reckoned to come down (it goes off there, or where it is); else null
+     * @param fx    in the air: the way it flies over the ground, a unit vector; else nought
+     */
+    private record Danger(int id, Vec3 at, Vec3 also, double reach, double off, double fx, double fz) {
+    }
+
+    /**
+     * The bombs in sight, each as last seen: {@code x, y, z}, when (ns), its speed over the ground
+     * ({@code vx, vz}) - and where it was reckoned to come down when it was first seen flying
+     * ({@code x, z}; NaN until then).
+     */
+    private final Map<Integer, double[]> bombsSeen = new HashMap<>();
+    /** Those a bomb was first seen by - it left their hand: the throwers. */
+    private final Set<Integer> throwers = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    /** A bomb first seen this near a living thing is that one's throw. */
+    static final double THROWN_FROM = 3.5;
+
+    /**
+     * The blast the body is deepest in, of the bombs in sight ({@code Combat.blastOf}: what the game's
+     * files say explodes, and how far round); {@code null} for none. A bomb in the air is reckoned to
+     * come down further along its way - at the point of it nearest the body: a lobber throws at the
+     * body, and the second it lies before it goes off is not enough to get six blocks from it.
+     */
+    private Danger danger(Vec3 me) {
+        if (combat == null) {
+            return null;
+        }
+        Danger worst = null;
+        long now = System.nanoTime();
+        double whole = maxHealth();
+        double left = health().orElse(1.0) * whole;
+        Set<Integer> live = new HashSet<>();
+        try {
+            for (int id : entities.trackedEntities()) {
+                Combat.Blast blast = combat.blastOf(id).orElse(null);
+                Vec3 p = blast == null ? null : entities.positionOf(id).orElse(null);
+                if (p == null) {
+                    continue;
+                }
+                live.add(id);
+                double[] seen = bombsSeen.get(id);
+                if (seen == null) {
+                    seen = new double[] {p.x(), p.y(), p.z(), now, 0, 0, Double.NaN, Double.NaN};
+                    bombsSeen.put(id, seen);
+                    thrownBy(p);
+                } else if (p.x() != seen[0] || p.y() != seen[1] || p.z() != seen[2]) {
+                    // Told anew by the server (a beat between two of its tellings sees the same place:
+                    // the speed last reckoned stands).
+                    double dt = (now - seen[3]) / 1e9;
+                    if (dt > 1e-3) {
+                        seen[4] = (p.x() - seen[0]) / dt;
+                        seen[5] = (p.z() - seen[2]) / dt;
+                    }
+                    seen[0] = p.x();
+                    seen[1] = p.y();
+                    seen[2] = p.z();
+                    seen[3] = now;
+                }
+                Vec3 also = null;
+                double fx = 0;
+                double fz = 0;
+                // Not told of anew for a while: it lies (the speed last reckoned is of its last move -
+                // taken for flight on and on, it had the body run this way and that by it, 22.11).
+                boolean lying = now - (long) seen[3] > BOMB_LYING_NS;
+                double speed = lying ? 0 : Math.hypot(seen[4], seen[5]);
+                if (speed > BOMB_FLYING) {
+                    double ux = seen[4] / speed;
+                    double uz = seen[5] / speed;
+                    fx = ux;
+                    fz = uz;
+                    if (Double.isNaN(seen[6])) {
+                        // Where it comes down: reckoned once, from where the body stands as it is
+                        // thrown - the point of its way nearest that. Not anew each beat: the nearest
+                        // point of its way to a body running from it runs along with the body, and the
+                        // body was sent this way and that under the bomb (and died there, 22.11).
+                        double along = clamp((me.x() - p.x()) * ux + (me.z() - p.z()) * uz, 0, BOMB_AHEAD);
+                        seen[6] = p.x() + ux * along;
+                        seen[7] = p.z() + uz * along;
+                    }
+                    // In the air: both that place and the bomb itself are kept clear of - it comes down
+                    // short as often as not, and rolls.
+                    also = new Vec3(seen[6], me.y(), seen[7]);
+                }
+                if (blast.damage() > 0 && blast.damage() < BLAST_WORTH * whole && blast.damage() < BLAST_WORTH_LEFT * left) {
+                    continue;   // a few points: stood, the bow drawn on
+                }
+                double reach = blast.radius() + BLAST_MARGIN;
+                double off = also == null ? dist(me, p) : Math.min(dist(me, p), dist(me, also));
+                if (off < reach && (worst == null || off < worst.off())) {
+                    worst = new Danger(id, p, also, reach, off, fx, fz);
+                }
+            }
+        } catch (LinkageError olderCore) {
+            return null;        // a core that does not tell what explodes: nothing to get out of
+        }
+        bombsSeen.keySet().retainAll(live);
+        return worst;
+    }
+
+    /**
+     * A draw of the bow waited out - unless a blast comes to reach the body meanwhile: a full draw is a
+     * second and more of standing still, and a bomb thrown in it has two seconds to live. Then the draw
+     * is let go (its arrow comes back) and {@code null} is the answer.
+     */
+    private BowSupport.Shot drawn(CompletableFuture<BowSupport.Shot> drawing) throws Exception {
+        long until = System.currentTimeMillis() + 35_000;
+        while (true) {
+            try {
+                return drawing.get(50, TimeUnit.MILLISECONDS);
+            } catch (java.util.concurrent.TimeoutException still) {
+                Vec3 me = movement.position();
+                if (me != null && danger(me) != null) {
+                    // Let go, and not waited on: the fuse does not wait either.
+                    bows.cancel();
+                    log.info("auto-fighter: a bomb on its way - the draw let go");
+                    return null;
+                }
+                if (System.currentTimeMillis() > until) {
+                    throw still;
+                }
+            }
+        }
+    }
+
+    /** Whose throw a bomb just seen at {@code p} is: the living thing nearest it, if one is by it. */
+    private void thrownBy(Vec3 p) {
+        OptionalInt self = entities.localEntityId();
+        int by = -1;
+        double nearest = THROWN_FROM;
+        for (int id : entities.trackedEntities()) {
+            if (self.isPresent() && self.getAsInt() == id || !living(id)) {
+                continue;
+            }
+            Vec3 at = entities.positionOf(id).orElse(null);
+            if (at != null && dist(at, p) < nearest) {
+                nearest = dist(at, p);
+                by = id;
+            }
+        }
+        if (by >= 0 && throwers.add(by)) {
+            log.info("auto-fighter: {} ({}) throws bombs - they are got out of, and it is shot between them",
+                    entities.labelOf(by), by);
+        }
+    }
+
+    /**
+     * A beat of getting out of a blast: the body goes to a place past the blast's reach - straight away
+     * from where it will go off, else to the sides - and nothing else is done meanwhile: no bow drawn,
+     * no bite taken. Planned anew when the blast point moves (the bomb bounced, another came down).
+     * Over when no blast reaches the body - the bomb went off, or the body is out of it: the fight goes
+     * on, with the bow. Guard and the sentry take the body for it as for an enemy.
+     *
+     * @return whether the beat went on it
+     */
+    private boolean dodge(Job j, Vec3 me) {
+        Danger d = danger(me);
+        if (d == null) {
+            if (j.dodging) {
+                stopDodge(j);
+                log.info("auto-fighter: out of the blast");
+            }
+            return false;
+        }
+        if (guarding(j) && !j.fighting && !beginFight(j)) {
+            return false;       // the body cannot be taken: nothing to move
+        }
+        if (!j.dodging) {
+            j.dodging = true;
+            j.dodges++;
+            stopChase(j);
+            stopRetreat(j);
+            stopStandOff(j);
+            log.info("auto-fighter: a {} goes off {} blocks from the body (it reaches {}) - out of its blast",
+                    entities.labelOf(d.id()), String.format(Locale.ROOT, "%.1f", d.off()),
+                    String.format(Locale.ROOT, "%.1f", d.reach() - BLAST_MARGIN));
+        }
+        CompletableFuture<NavResult> going = j.dodgeTrip;
+        boolean running = going != null && !going.isDone();
+        // A way out once taken is kept to while the place it goes to stays clear of the blast. Planned
+        // anew on every shift of the blast point, the body was turned this way and that under the bomb
+        // for the whole of its fuse (22.11).
+        if (running && j.dodgeGoal != null && clear(d, j.dodgeGoal.x(), j.dodgeGoal.z())) {
+            status = "Getting out of a bomb's blast.";
+            return true;
+        }
+        if (running || j.dodgeFrom == null || dist(d.at(), j.dodgeFrom) > BLAST_MOVED) {
+            if (running) {
+                going.cancel(false);
+            }
+            j.dodgeTrip = null;
+            j.dodgeGoal = null;
+            j.dodgeFrom = d.at();
+            j.noWayOut = false;
+            out(d, me, j.dodgeTo);
+        }
+        Goal next = j.dodgeTo.poll();
+        while (next != null && !clear(d, next.x(), next.z())) {
+            next = j.dodgeTo.poll();
+        }
+        j.dodgeTrip = null;
+        j.dodgeGoal = null;
+        if (next == null) {
+            if (!j.noWayOut) {
+                j.noWayOut = true;
+                log.info("auto-fighter: no way out of the blast from here - it is stood");
+            }
+            return false;   // nowhere to go: the fight, where the body stands
+        }
+        j.dodgeGoal = next;
+        j.dodgeTrip = navigator.goTo(next);
+        status = "Getting out of a bomb's blast.";
+        return true;
+    }
+
+    /** Whether a cell is clear of a blast: of where the bomb is, and of where it was reckoned to come down. */
+    private static boolean clear(Danger d, int cx, int cz) {
+        double need = d.reach() + DODGE_GOAL;
+        double x = cx + 0.5;
+        double z = cz + 0.5;
+        return Math.hypot(x - d.at().x(), z - d.at().z()) >= need
+                && (d.also() == null || Math.hypot(x - d.also().x(), z - d.also().z()) >= need);
+    }
+
+    /**
+     * The places out of a blast nearest the body: along each of sixteen ways the first cell clear of it
+     * where the body can stand, the shortest first - across a flying bomb's way before along it. Not farther than that (the owner's word, 22.11: no
+     * need to keep farther off - the bow comes first).
+     */
+    private void out(Danger d, Vec3 me, java.util.ArrayDeque<Goal> into) {
+        into.clear();
+        List<double[]> found = new ArrayList<>();
+        int feet = (int) Math.floor(me.y() + 1e-3);
+        for (int k = 0; k < 16; k++) {
+            double dx = Math.cos(k * Math.PI / 8);
+            double dz = Math.sin(k * Math.PI / 8);
+            for (double r = 1.0; r <= 16.0; r += 0.5) {
+                int cx = (int) Math.floor(me.x() + dx * r);
+                int cz = (int) Math.floor(me.z() + dz * r);
+                if (!clear(d, cx, cz)) {
+                    continue;
+                }
+                Integer y = standY(cx, feet, cz);
+                if (y != null) {
+                    found.add(new double[] {r + ALONG_ITS_WAY * Math.abs(dx * d.fx() + dz * d.fz()), cx, y, cz});
+                    break;
+                }
+            }
+        }
+        found.sort(java.util.Comparator.comparingDouble(f -> f[0]));
+        Set<Long> cells = new HashSet<>();
+        for (double[] f : found) {
+            if (cells.add(((long) f[1] << 32) ^ ((long) f[3] & 0xffffffffL)) && into.size() < 6) {
+                into.add(new Goal((int) f[1], (int) f[2], (int) f[3], DODGE_GOAL));
+            }
+        }
+    }
+
+    private void stopDodge(Job j) {
+        CompletableFuture<NavResult> trip = j.dodgeTrip;
+        j.dodgeTrip = null;
+        j.dodgeGoal = null;
+        j.dodgeTo.clear();
+        j.dodging = false;
+        j.dodgeFrom = null;
+        j.noWayOut = false;
+        if (trip != null && !trip.isDone()) {
+            trip.cancel(false);     // this trip only: a job waiting on the urgent hold keeps its own
         }
     }
 
