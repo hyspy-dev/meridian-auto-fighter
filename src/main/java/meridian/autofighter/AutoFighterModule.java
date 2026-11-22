@@ -32,7 +32,7 @@ import meridian.core.api.World;
 public class AutoFighterModule implements ProxyModule {
 
     private static final String USAGE = "guard [radius] | farm <kind> [count, -1 no end] [radius] | escort <player> [distance]"
-            + " | stop | status | set heal|retreat <percent> | set block|repair|players|pickup|guardjobs|overpower on|off"
+            + " | stop | status | set heal|retreat|resume <percent> | set block|repair|players|pickup|guardjobs|overpower on|off"
             + " | set hostile <kind,kind,...> | set radius <blocks> | set bow on|off | set bowdistance <blocks>";
 
     /** What the Start button starts. */
@@ -65,6 +65,8 @@ public class AutoFighterModule implements ProxyModule {
     private volatile int escortDistance = 3;
     private volatile int healAt = 50;
     private volatile int retreatAt = 25;
+    /** After a retreat, the body rests out of the fight until health is back this high. */
+    private volatile int resumeAt = 80;
     private volatile boolean block = true;
     private volatile boolean repair = true;
     /** With no mode started, fight for core's jobs that have the body (the miner's, the builder's, a trip). */
@@ -125,6 +127,7 @@ public class AutoFighterModule implements ProxyModule {
         SettingsSpec survival = SettingsSpec.builder()
                 .int_("fightHealAt", "Heal at health (%)", 0, 100, healAt, v -> healAt = v)
                 .int_("fightRetreatAt", "Back off at health (%)", 0, 100, retreatAt, v -> retreatAt = v)
+                .int_("fightResumeAt", "Back to the fight at health (%)", 0, 100, resumeAt, v -> resumeAt = v)
                 .bool("fightBlock", "Block when the enemy swings", block, v -> block = v)
                 .bool("fightOverpower", "Overpower: my swing always lands, the guard after it", overpower,
                         v -> overpower = v)
@@ -152,7 +155,7 @@ public class AutoFighterModule implements ProxyModule {
         // setters at the start.
         spec.persistent("fightGuardJobs", "fightMode", "fightHostile", "fightPlayers", "fightRadius", "fightFarmKind",
                 "fightFarmCount", "fightFarmRadius", "fightPickUp", "fightEscortName", "fightEscortDistance",
-                "fightBow", "fightBowDistance", "fightHealAt", "fightRetreatAt", "fightBlock", "fightOverpower", "fightRepair", "fightShowTarget");
+                "fightBow", "fightBowDistance", "fightHealAt", "fightRetreatAt", "fightResumeAt", "fightBlock", "fightOverpower", "fightRepair", "fightShowTarget");
         ctx.registerSettings(SettingsSpec.builder().section("Fight", spec.build()).build());
         ctx.getLogger().info("meridian-auto-fighter enabled");
     }
@@ -167,7 +170,8 @@ public class AutoFighterModule implements ProxyModule {
     }
 
     private Fighter.Options options() {
-        return new Fighter.Options(hostile, players, radius, healAt, retreatAt, block, repair, pickUp, overpower, bow, bowDistance);
+        return new Fighter.Options(hostile, players, radius, healAt, retreatAt, resumeAt, block, repair, pickUp, overpower,
+                bow, bowDistance);
     }
 
     /** Starts what the mode says; the Fight line says how it goes. */
@@ -243,7 +247,7 @@ public class AutoFighterModule implements ProxyModule {
     }
 
     /**
-     * {@code set heal|retreat <percent> | set block|repair|players|pickup|guardjobs|overpower on|off |
+     * {@code set heal|retreat|resume <percent> | set block|repair|players|pickup|guardjobs|overpower on|off |
      * set hostile <a,b> | set radius <n>}.
      */
     private Map<String, Object> set(Fighter fighter, List<String> args) {
@@ -253,6 +257,7 @@ public class AutoFighterModule implements ProxyModule {
         switch (what) {
             case "heal" -> healAt = Integer.parseInt(value);
             case "retreat" -> retreatAt = Integer.parseInt(value);
+            case "resume" -> resumeAt = Integer.parseInt(value);
             case "block" -> block = on;
             case "repair" -> repair = on;
             case "players" -> players = on;
@@ -279,6 +284,7 @@ public class AutoFighterModule implements ProxyModule {
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("heal", healAt);
         out.put("retreat", retreatAt);
+        out.put("resume", resumeAt);
         out.put("block", block);
         out.put("repair", repair);
         out.put("players", players);

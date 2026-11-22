@@ -72,6 +72,8 @@ final class Fighter {
      * @param radius    how far round the body (Escort: the player) an enemy on sight is fought
      * @param healAt    health, in percent, at or under which it heals
      * @param retreatAt health, in percent, at or under which it backs off to heal
+     * @param resumeAt  health, in percent, it rests out of the fight to after a retreat - the slow
+     *                  heal of a food under way, a bite more only where that falls short
      * @param block     raise the guard when the target begins an attack
      * @param repair    repair a worn weapon with a kit from the hotbar
      * @param pickUp    Farm: pick up what the kills drop
@@ -79,12 +81,12 @@ final class Fighter {
      *                  through. Off, the guard cuts the swing short where its rules let it, as the
      *                  game does ({@link InteractionControl#useItem(Duration, boolean)})
      */
-    record Options(List<String> hostile, boolean players, double radius, int healAt, int retreatAt, boolean block,
-                   boolean repair, boolean pickUp, boolean overpower, boolean bow, double bowDistance) {
+    record Options(List<String> hostile, boolean players, double radius, int healAt, int retreatAt, int resumeAt,
+                   boolean block, boolean repair, boolean pickUp, boolean overpower, boolean bow, double bowDistance) {
 
         static final List<String> HOSTILE = List.of("Zombie", "Skeleton", "Spider", "Goblin", "Trork", "Scarak",
                 "Wraith", "Void", "Ghoul", "Outlander");
-        static final Options DEFAULT = new Options(HOSTILE, false, 12, 50, 25, true, true, true, false, true, 6);
+        static final Options DEFAULT = new Options(HOSTILE, false, 12, 50, 25, 80, true, true, true, false, true, 6);
     }
 
     /** What a job did. */
@@ -130,8 +132,60 @@ final class Fighter {
     static final double WORN = 0.10;
     /** How far a retreat goes, at most. */
     static final double RETREAT = 8;
-    /** After a retreat, none again for this long. */
-    static final long RETREAT_COOLDOWN_MS = 8000;
+    /**
+     * A bite is taken in the thick of a fight only for this share of the max health within its first
+     * {@link #FAST_SECONDS} - a potion's - or when no slow heal is under way: a food's slow heal
+     * starts over with each bite, so a second one mid-fight is seconds of standing for its instant part.
+     */
+    static final double BIG_BITE = 0.15;
+    static final double FAST_SECONDS = 6;
+    /** An item that would add less than this share of the max health is not worth the bite. */
+    static final double LEAST_GAIN = 0.01;
+
+    /**
+     * The last use of a healing item, and how things stood when it was made: the health, the effects
+     * on the player. What a use did the server tells a moment after its chain ends - the effects it
+     * put on, the health - and until it has, there is nothing new to decide on: a bite taken is not
+     * followed by another (its healing is not in core's count yet), and an item the server refused
+     * is not tried again while all stands as it did (it would be refused the same).
+     *
+     * <p>Seen once, the server's word stays seen ({@code told}): the health coming back to what it
+     * was - a hit after a potion - is not the use untold again. Every beat looks ({@link #noteBite}).
+     *
+     * @param taken   the server took the item from the stack
+     * @param health  the health then, a share of its max
+     * @param effects the effects on the player then, each with the seconds it had left
+     * @param told    the server has told what the use did (or, of one refused, that things changed)
+     */
+    private record Bite(String item, boolean taken, double health, Map<String, Double> effects, boolean told) {
+    }
+
+    private volatile Bite bite;
+
+    /**
+     * The enemies the body ran from, health low and nothing to heal with ({@link #flee}) - fallen
+     * behind, or not to be outrun. None of them is run from again: one that has the body within its
+     * senses once more will make it its target, and is fought at once, not waited on for its blow.
+     */
+    private final Set<Integer> fledFrom = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    /** Running adds less than this to the gap in one leg: the enemy keeps up, and is not to be outrun. */
+    static final double GAINED = 1.0;
+    /**
+     * One taken for an enemy stays one this far past where it became one - the radius, what it
+     * senses: at 12.0 blocks an enemy and at 12.4 none is no way to hold a fight (the owner's run of
+     * 22.11: one arrow, and the body went back to the dig).
+     */
+    static final double EDGE = 2.0;
+    /** One left alone that has come this much nearer the body since is coming at it: left alone no more. */
+    static final double COMING = 2.0;
+    /** A kind that attacks from farther than this - a flame, a bomb, an arrow - is fought from afar. */
+    static final double RANGED = 4.5;
+    /** How far past what such a one reaches the body keeps, to shoot from: it comes on while the bow is drawn. */
+    static final double STANDOFF = 4.0;
+    /** One slower than this is stepped back from; a faster one closes whatever the body does. */
+    static final double OUTRUN = 4.5;
+    /** Nearer than this there is no drawing a bow. */
+    static final double BOW_NEAR = 3.0;
     /** A player who takes the body back in a Guard fight is left to it for this long. */
     static final long PLAYER_TOOK_MS = 10_000;
     /**
@@ -303,9 +357,14 @@ final class Fighter {
                 out.put("targetLabel", entities.labelOf(j.target));
             }
             out.put("fighting", j.fighting);
+            out.put("resting", j.resting);
+            out.put("retreating", j.retreating);
+            out.put("fleeing", j.fleeFrom >= 0);
+            out.put("flights", j.flights);
             out.putAll(counts(j.result("RUNNING")));
         }
         health().ifPresent(h -> out.put("health", Math.round(h * 1000) / 10.0));
+        out.put("healingUnderWay", Math.round(hands.healing().overTime() * 10) / 10.0);
         return out;
     }
 
@@ -381,9 +440,9 @@ final class Fighter {
             Result r = null;
             try {
                 try {
-                    before.get(30, TimeUnit.SECONDS);   // the one before gives its holds back first
-                } catch (Exception ignored) {
-                    // ended badly or slowly: this one goes on
+                    before.get();       // the one before gives its holds back first: told to stop, it ends its beat
+                } catch (java.util.concurrent.ExecutionException | java.util.concurrent.CancellationException ignored) {
+                    // it ended badly: this one goes on
                 }
                 current = j;
                 r = run(j);
@@ -461,7 +520,43 @@ final class Fighter {
         final Map<Integer, Vec3> lastAt = new HashMap<>();
         /** The items lying about before a kill: not its drops. */
         final Set<Integer> lying = new HashSet<>();
-        long retreatAgain;
+        /**
+         * Backed off once in this spell of low health: not again until the health has been back over
+         * {@link Options#retreatAt} - an enemy that came after the body is fought, not run from in rounds.
+         */
+        boolean retreated;
+        /** Backing off: the places to try, nearest the way straight from the enemy first; the trip under way. */
+        final java.util.ArrayDeque<Goal> retreatTo = new java.util.ArrayDeque<>();
+        CompletableFuture<NavResult> retreatTrip;
+        boolean retreating;
+        /** The enemies of the beat before: one of them is not dropped at the very edge ({@link #EDGE}). */
+        final Set<Integer> minded = new HashSet<>();
+        /** Where each enemy left alone stood when it was: one that has come nearer since is coming. */
+        final Map<Integer, Vec3> passedAt = new HashMap<>();
+        /** Stepping back out of the reach of one that attacks from afar: the places to try, the trip. */
+        final java.util.ArrayDeque<Goal> standOffTo = new java.util.ArrayDeque<>();
+        CompletableFuture<NavResult> standOffTrip;
+        boolean standingOff;
+        /** The foe there was nowhere to step back from, and where that was: fought where the body stands. */
+        int noRoom = -1;
+        Vec3 noRoomAt;
+        /** Why the last shot was not made: said once, not every beat. */
+        String noShot;
+        /** Running from this enemy ({@link #flee}); {@code -1} when from none. */
+        int fleeFrom = -1;
+        /** The places the leg of the run under way tries, and its trip; how far the enemy was when it began. */
+        final java.util.ArrayDeque<Goal> fleeTo = new java.util.ArrayDeque<>();
+        CompletableFuture<NavResult> fleeTrip;
+        double fleeGap;
+        int flights;
+        /** Out of the fight until the health is back ({@link Options#resumeAt}), or nothing heals it. */
+        boolean resting;
+        /**
+         * The rest began with a retreat: backing off is what heals ({@link Options#retreatAt}), so it
+         * takes a bite wherever the healing under way falls short. A rest after a fight that only left
+         * the health low eats by the owner's mark for eating alone ({@link Options#healAt}).
+         */
+        boolean restBites;
         long playerTookUntil;
         long idleSince = System.currentTimeMillis();
         int kills;
@@ -558,6 +653,7 @@ final class Fighter {
                 }
                 String over;
                 try {
+                    noteBite();
                     over = switch (j.mode) {
                         case GUARD, SENTRY -> guardBeat(j);
                         case FARM -> farmBeat(j);
@@ -596,6 +692,9 @@ final class Fighter {
                 combat.unsubscribe(j.hurt);
             }
             stopChase(j);
+            stopRetreat(j);
+            stopFlee(j);
+            stopStandOff(j);
             unmark();
             if (j.fighting) {
                 endFight(j);
@@ -634,11 +733,18 @@ final class Fighter {
             return null;
         }
         List<Integer> enemies = enemies(j, me, j.options().radius(), me);
+        if (enemies.isEmpty() && j.fleeFrom >= 0) {
+            fled(j, "it is out of what it senses, or out of sight");
+        }
+        if (enemies.isEmpty() && j.fighting && j.lost == null && restsAfter(j)) {
+            return null;    // the body kept until the health is back: the job would lead it off hurt
+        }
         if (enemies.isEmpty()) {
             if (j.fighting) {
-                if (j.target >= 0 && alive(j.target)) {
+                if (j.target >= 0 && alive(j.target) && !j.struck.containsKey(j.target)) {
                     // Gone out of the radius alive - away, or the chase led the body off: not taken up
-                    // again the moment the job brings the body back near it.
+                    // again the moment the job brings the body back near it. (Not one we struck: that
+                    // one is out of what it minds, and an enemy again the moment it is back in it.)
                     pass(j, j.target, "out of the radius alive");
                 }
                 endFight(j);
@@ -668,7 +774,12 @@ final class Fighter {
             }
             j.lost = null;
             j.fighting = false;
+            j.resting = false;
+            j.retreated = false;
             j.wheel = null;
+            stopRetreat(j);
+            stopFlee(j);
+            stopStandOff(j);
             stopChase(j);
             unmark();
             return null;
@@ -702,6 +813,10 @@ final class Fighter {
             }
         }
         targets.addAll(prey);
+        if (targets.isEmpty() && restsAfter(j)) {
+            j.idleSince = System.currentTimeMillis();
+            return null;
+        }
         if (targets.isEmpty()) {
             stopChase(j);
             unmark();
@@ -787,6 +902,7 @@ final class Fighter {
                 continue;
             }
             double fromCenter = dist(at, center);
+            double far = dist(at, me);
             boolean player = entities.isPlayer(id);
             boolean hitUs = combat != null && combat.hitBy(id, HIT_MEMORY);
             boolean swung = combat != null && combat.swingOf(id, SWING_MEMORY).isPresent()
@@ -795,23 +911,83 @@ final class Fighter {
             if (player) {
                 enemy = j.options().players() && (hitUs || swung);
             } else {
-                enemy = hitUs || swung || (fromCenter <= radius && hostileKind(id, j.options().hostile()));
+                // A hostile kind: within the radius the owner set - or past it, where the body is
+                // within what the mob itself senses: it will come, and is not waited on for its blow.
+                // One that is an enemy already stays one a little past either ({@link #EDGE}).
+                double edge = j.minded.contains(id) ? EDGE : 0;
+                enemy = hitUs || swung || (hostileKind(id, j.options().hostile())
+                        && (fromCenter <= radius + edge || noticedBy(id, Math.min(fromCenter, far) - edge, radius)));
+            }
+            // One we struck ourselves - a blow, an arrow - minds us from then on, and comes: an enemy
+            // while it lives and is within what it goes on minding, whatever the radius.
+            boolean struck = !player && j.struck.containsKey(id) && far <= struckReach(id, radius);
+            enemy |= struck;
+            if (enemy && fledFrom.contains(id) && !noticedBy(id, dist(at, me), radius)) {
+                enemy = false;      // run from, and fallen behind: none of ours until it is near again
             }
             if (enemy && !(combat != null && combat.hitBy(id, HIT_NOW))) {
                 // Not hitting us now: one left alone stays so, and one by its kind or its swing only is
                 // an enemy when the eyes see it - a mob behind a wall is no threat to the job.
                 Long until = j.passed.get(id);
                 if (until != null && until > System.currentTimeMillis()) {
-                    enemy = false;
-                } else if (!hitUs && !(swung && j.mode == Mode.ESCORT) && !sees(id, at)) {
+                    Vec3 stood = j.passedAt.get(id);
+                    if (stood != null && far < dist(stood, me) - COMING) {
+                        // Left alone - and it has come at the body since: not waited on for its blow.
+                        j.passed.remove(id);
+                        j.passedAt.remove(id);
+                    } else {
+                        enemy = false;
+                    }
+                }
+                if (enemy && !hitUs && !struck && !(swung && j.mode == Mode.ESCORT) && !sees(id, at)) {
                     enemy = false;
                 }
             }
-            if (enemy && fromCenter <= radius + LEASH) {
+            double leash = Math.max(Math.max(radius, reachOfSenses(id)), struck ? struckReach(id, radius) : 0) + LEASH;
+            if (enemy && fromCenter <= leash) {
                 out.add(id);
             }
         }
+        fledFrom.removeIf(id -> !alive(id) || entities.positionOf(id).isEmpty());
+        j.minded.clear();
+        j.minded.addAll(out);
         return sorted(me, out);
+    }
+
+    /**
+     * How far off one we struck stays an enemy: within what its kind goes on minding once alerted (a
+     * goblin's 20-25 blocks) - but no farther than the leash past the radius: the body is not led off
+     * across the world after something it hit once.
+     */
+    private double struckReach(int id, double radius) {
+        Combat.Senses s = senses(id);
+        double minds = s == null ? 0 : Math.max(s.alertedRange(), Math.max(s.viewRange(), s.hearingRange()));
+        return minds > 0 ? Math.min(minds, radius + LEASH) : radius + LEASH;
+    }
+
+    /** What the entity's kind senses, as the game's files have it; {@code null} when not known. */
+    private Combat.Senses senses(int id) {
+        try {
+            return combat == null ? null : combat.sensesOf(id).orElse(null);
+        } catch (LinkageError olderCore) {
+            return null;        // a core that does not tell: the radius set, as before
+        }
+    }
+
+    /** How far the entity's kind notices the player from - it sees that far, or hears; {@code 0} when not known. */
+    private double reachOfSenses(int id) {
+        Combat.Senses s = senses(id);
+        return s == null ? 0 : Math.max(s.viewRange(), s.hearingRange());
+    }
+
+    /**
+     * Whether a hostile kind this far off will take the player for its target: the player is within
+     * what it sees or hears (the owner's word, 21.11: such a one is fought at once, not waited on for
+     * its blow). A kind the game's files do not tell of: within the radius set.
+     */
+    private boolean noticedBy(int id, double far, double radius) {
+        double reach = reachOfSenses(id);
+        return far <= (reach > 0 ? reach : radius);
     }
 
     /** Whether an entity's model id holds one of the parts on the list, case aside. */
@@ -943,6 +1119,10 @@ final class Fighter {
     /** Guard: the fight is over - the slot held before taken again, the body given back to whoever had it. */
     private void endFight(Job j) {
         stopChase(j);
+        stopRetreat(j);
+        stopFlee(j);
+        stopStandOff(j);
+        j.retreated = false;
         unmark();
         j.target = -1;
         j.fighting = false;
@@ -962,9 +1142,51 @@ final class Fighter {
         }
     }
 
+    /**
+     * A beat of stepping back from one that attacks from afar: the trip to the place being tried goes
+     * on; one that did not get there gives way to the next place. Over on getting to one - then the bow
+     * - or with no place left: then there is no room, and it is fought where the body stands.
+     *
+     * @return whether the beat went on it
+     */
+    private boolean stepBack(Job j, int target) {
+        CompletableFuture<NavResult> trip = j.standOffTrip;
+        if (trip != null && !trip.isDone()) {
+            return true;
+        }
+        NavResult r = trip == null || trip.isCancelled() || trip.isCompletedExceptionally() ? null : trip.getNow(null);
+        j.standOffTrip = null;
+        boolean back = r != null && r.arrived();
+        Goal next = back ? null : j.standOffTo.poll();
+        if (next == null) {
+            j.standOffTo.clear();
+            j.standingOff = false;
+            if (!back) {
+                j.noRoom = target;
+                j.noRoomAt = movement.position();
+                log.info("auto-fighter: nowhere to step back to from {} - fought from here", target);
+            }
+            return false;
+        }
+        j.standOffTrip = navigator.goTo(next);
+        return true;
+    }
+
+    private void stopStandOff(Job j) {
+        CompletableFuture<NavResult> trip = j.standOffTrip;
+        j.standOffTrip = null;
+        j.standOffTo.clear();
+        j.standingOff = false;
+        j.noRoom = -1;
+        if (trip != null && !trip.isDone()) {
+            trip.cancel(false);     // this trip only: a job waiting on the urgent hold keeps its own
+        }
+    }
+
     /** One beat of a fight with {@code target}. */
     private void fight(Job j, int target, Vec3 me) throws Exception {
         if (j.target != target) {
+            stopStandOff(j);
             j.target = target;
             log.info("auto-fighter: fighting {} ({})", entities.labelOf(target), target);
         }
@@ -976,25 +1198,113 @@ final class Fighter {
         j.lastAt.put(target, at);
         mark(target, at);
         double hp = health().orElse(1.0);
-        int healSlot = healSlot();
-        if (hp * 100 <= j.options().retreatAt() && healSlot >= 0 && System.currentTimeMillis() > j.retreatAgain) {
+        if (hp * 100 > Math.max(j.options().retreatAt(), j.options().healAt())) {
+            j.retreated = false;        // the spell of low health is over
+        }
+        // Under fire: something hit the body within the last second - a flame, an arrow, a blow.
+        boolean underFire = combat != null
+                && combat.hits(Duration.ofSeconds(1)).stream().anyMatch(h -> h.amount() > 0);
+        if (j.fleeFrom >= 0) {
+            if (flee(j, me)) {
+                return;
+            }
+            if (fledFrom.contains(target) && !noticedBy(target, dist(at, me), j.options().radius())) {
+                return;     // it fell behind: no enemy now, and nothing of this beat goes after it
+            }
+        }
+        if (j.retreating && backOff(j)) {
+            return;
+        }
+        if (j.resting && rest(j, target, hp)) {
+            return;
+        }
+        if (hp * 100 <= j.options().retreatAt() && !fledFrom.contains(target) && !entities.isPlayer(target)
+                && hands.healing().overTime() <= 0 && !carriesHeal() && !awaited()) {
+            // Low, and nothing brings it back: no fight to be had with it. Run, until it falls behind.
+            // (Nothing at all: a potion that is only cooling down is something to heal with.)
+            beginFlight(j, target, me);
+            return;
+        }
+        // Backing off to heal: at the mark for it - and already at the mark for eating when the body
+        // is under fire (nothing is eaten in a flame: the server breaks the bite off, and the body
+        // stood still for it - the owner's run of 22.11 ended there, at 3 of 100).
+        if ((hp * 100 <= j.options().retreatAt() || (hp * 100 <= j.options().healAt() && underFire)) && !j.retreated
+                && (hands.healing().overTime() > 0 || healSlot() >= 0 || awaited())) {
             retreat(j, target, me);
             return;
         }
-        if (hp * 100 <= j.options().healAt() && healSlot >= 0 && !coming(target)) {
-            heal(j, healSlot);
-            return;
+        if (hp * 100 <= j.options().healAt() && !coming(target) && !underFire) {
+            int slot = healSlot();
+            if (slot >= 0 && worthABite(gainOf(slot), hp, j.options().resumeAt(), true)) {
+                heal(j, slot);
+                return;
+            }
         }
-        if (j.options().bow() && me.distanceSqTo(at) > j.options().bowDistance() * j.options().bowDistance()
-                && bows.slot() >= 0) {
+        // One that attacks from afar - a flame's six blocks, a bomb's twelve - is fought from afar
+        // (the owner's word, 22.11): out of what it reaches, with the bow; the sword only where there
+        // is no other way - no bow, no arrow, no room and no shot.
+        boolean bowAtHand = j.options().bow() && bows.slot() >= 0;
+        Combat.Senses foe = senses(target);
+        double far = Math.sqrt(me.distanceSqTo(at));
+        if (j.noRoom == target && j.noRoomAt != null && dist(me, j.noRoomAt) > 4) {
+            j.noRoom = -1;      // the body is elsewhere now: there may be room again
+        }
+        // Kept off: it reaches far, there is a bow, and room to step back in. With no room it is
+        // fought as any other - the bow from afar, the sword once it is near: no other way is left.
+        boolean ranged = bowAtHand && foe != null && foe.attackDistance() > RANGED && j.noRoom != target;
+        if (ranged && !j.standingOff && far < foe.attackDistance() + STANDOFF
+                && foe.maxSpeed() > 0 && foe.maxSpeed() < OUTRUN) {
+            // Within what it reaches, and it is slow: back first, out of it.
+            Vec3 from = at;
+            double dx = me.x() - from.x();
+            double dz = me.z() - from.z();
+            double len = Math.hypot(dx, dz);
+            if (len < 1e-3) {
+                dx = 1;
+                dz = 0;
+                len = 1;
+            }
+            away(me, dx / len, dz / len, j.standOffTo);
+            j.standOffTrip = null;
+            j.standingOff = true;
+            stopChase(j);
+            log.info("auto-fighter: {} ({}) reaches {} blocks and is {} off - stepping back to shoot",
+                    entities.labelOf(target), target, foe.attackDistance(), String.format(Locale.ROOT, "%.1f", far));
+        }
+        if (j.standingOff) {
+            status = "Fighting " + entities.labelOf(target) + ": stepping back out of its reach.";
+            if (stepBack(j, target)) {
+                return;
+            }
+        }
+        if (bowAtHand && (ranged ? far > BOW_NEAR : far > j.options().bowDistance())) {
             stopChase(j);
             movement.stop();
             status = "Fighting " + entities.labelOf(target) + ": drawing bow.";
-            BowSupport.Shot shot = bows.shoot(target).get(35, TimeUnit.SECONDS);
+            // One kept off is slow, and there is time: the bow's full draw. The shortest one that reaches
+            // takes a few points of a goblin's hundred and sixty, and the lane ends before the goblin does.
+            BowSupport.Shot shot = bows.shoot(target, ranged).get(35, TimeUnit.SECONDS);
             if (shot.sent()) {
                 j.swings++;
                 j.struck.put(target, System.currentTimeMillis());
+                j.chaseFor = -1;
+                j.noShot = null;
                 log.info("meridian-auto-fighter: bow at {}: {}", target, shot.reason());
+                return;
+            }
+            if (!shot.reason().equals(j.noShot)) {
+                j.noShot = shot.reason();
+                log.info("meridian-auto-fighter: no shot at {}: {}", target, shot.reason());
+            }
+            if (ranged && bows.slot() >= 0) {
+                // One that reaches far is not run at because a shot was not made. No line to it, no
+                // flight that gets there: it is left be (and is an enemy again the moment it comes).
+                // Anything else - the bow busy, the body still moving - is over by the next beat.
+                if (shot.reason().startsWith("UNREACHABLE") || shot.reason().startsWith("UNKNOWN_TARGET")) {
+                    pass(j, target, "no shot at it: " + shot.reason());
+                    j.target = -1;
+                    unmark();
+                }
                 return;
             }
             // A wall, unknown trajectory or missing ammo: approach with the melee weapon.
@@ -1262,8 +1572,8 @@ final class Fighter {
     /** Between fights: a heal when health is low, a repair when the weapon is worn - each quickly, the body taken first. */
     private void upkeep(Job j, Vec3 me) throws Exception {
         double hp = health().orElse(1.0);
-        int healSlot = healSlot();
-        boolean heal = hp * 100 <= j.options().healAt() && healSlot >= 0;
+        int healSlot = hp * 100 <= j.options().healAt() ? healSlot() : -1;
+        boolean heal = healSlot >= 0 && worthABite(gainOf(healSlot), hp, j.options().resumeAt(), false);
         Player p = world.player().orElse(null);
         int weapon = p == null ? -1 : p.bestWeaponSlot();
         boolean repair = j.options().repair() && weapon >= 0 && worn(weapon) && kitInHotbar();
@@ -1299,33 +1609,150 @@ final class Fighter {
     // Survival
     // ------------------------------------------------------------------
 
-    /** The hotbar slot whose item heals the most at once (else over time), or {@code -1}. */
+    /**
+     * The hotbar slot whose item would add the most to the health soon - its gain over the healing
+     * under way, as core plays its use on the effects on now ({@link InteractionControl#healGain}) -
+     * else the most in all; {@code -1} for none that would add {@link #LEAST_GAIN} of the max.
+     */
     private int healSlot() {
         Player p = world.player().orElse(null);
         if (p == null) {
             return -1;
         }
+        double least = LEAST_GAIN * maxHealth();
         int best = -1;
-        double bestNow = -1;
+        double bestFast = -1;
         double bestTotal = -1;
+        Bite last = noteBite();
+        String refused = last != null && !last.taken() && !last.told() ? last.item() : null;
         for (int slot = 0; slot < 9; slot++) {
             String id = p.hotbarItem(slot);
-            if (id == null) {
+            if (id == null || id.equals(refused) || healOf(id).isEmpty()) {
                 continue;
             }
-            Optional<InteractionControl.Heal> h = healOf(id);
-            if (h.isEmpty()) {
+            InteractionControl.Heal g = hands.healGain(id).orElse(InteractionControl.Heal.NONE);
+            if (g.total() < least) {
                 continue;
             }
-            double now = h.get().now();
-            double total = h.get().total();
-            if (now > bestNow || (now == bestNow && total > bestTotal)) {
+            double fast = fast(g);
+            if (fast > bestFast || (fast == bestFast && g.total() > bestTotal)) {
                 best = slot;
-                bestNow = now;
-                bestTotal = total;
+                bestFast = fast;
+                bestTotal = g.total();
             }
         }
         return best;
+    }
+
+    /** What the item in {@code slot} would add to the health now, the healing under way counted. */
+    private InteractionControl.Heal gainOf(int slot) {
+        Player p = world.player().orElse(null);
+        String id = p == null ? null : p.hotbarItem(slot);
+        return id == null ? InteractionControl.Heal.NONE : hands.healGain(id).orElse(InteractionControl.Heal.NONE);
+    }
+
+    /** The part of a heal that comes within {@link #FAST_SECONDS}: the instant part and the slow one's start. */
+    private static double fast(InteractionControl.Heal h) {
+        double slow = h.seconds() > FAST_SECONDS ? h.overTime() * FAST_SECONDS / h.seconds() : h.overTime();
+        return h.now() + slow;
+    }
+
+    /**
+     * Whether a bite of what would add {@code gain} is worth it, health at {@code hp} (a share) wanted
+     * back up to {@code upTo} percent: only where the healing under way falls short of it - a
+     * food's slow heal runs for minutes, and another bite only starts it over. In a fight, a bite
+     * that heals much at once (a potion) is taken all the same.
+     */
+    private boolean worthABite(InteractionControl.Heal gain, double hp, int upTo, boolean inFight) {
+        if (awaited()) {
+            return false;       // the last bite's healing is not told yet: judged then, on what is
+        }
+        double max = maxHealth();
+        if (gain.total() < LEAST_GAIN * max) {
+            return false;
+        }
+        if (inFight && fast(gain) >= BIG_BITE * max) {
+            return true;
+        }
+        double needed = (Math.max(upTo / 100.0, 0) - hp) * max;
+        return needed > 0 && hands.healing().overTime() < needed;
+    }
+
+    /** Whether the hotbar holds anything whose use heals - usable this moment or not (a potion cooling down). */
+    private boolean carriesHeal() {
+        Player p = world.player().orElse(null);
+        if (p == null) {
+            return false;
+        }
+        for (int slot = 0; slot < 9; slot++) {
+            String id = p.hotbarItem(slot);
+            if (id != null && healOf(id).isPresent()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** A bite was taken and the server has not told what it did yet. */
+    private boolean awaited() {
+        Bite b = noteBite();
+        return b != null && b.taken() && !b.told();
+    }
+
+    /** Looks whether the server has told of the last use yet, and keeps that it has. */
+    private Bite noteBite() {
+        Bite b = bite;
+        if (b != null && !b.told() && told(b)) {
+            b = new Bite(b.item(), b.taken(), b.health(), b.effects(), true);
+            bite = b;
+        }
+        return b;
+    }
+
+    /**
+     * Whether the server has told what the use did.
+     *
+     * <p>Of a bite taken: its own result - an effect arrived (a new one, or one put on anew: it has
+     * more time left than it had), or the health went up. A food's and a potion's healing both come as
+     * effects, and the server tells of them some time after the chain has ended (0.6-1.4 s in the
+     * stand's logs; the stack going down is told BEFORE the chain ends, and is no word on the healing).
+     * A hit in between - the health down - is not it, nor is an effect going: an overwrite takes the
+     * effect off before it puts it back on.
+     *
+     * <p>Of a use refused: that anything stands otherwise than it did - the health either way, the
+     * effects on.
+     */
+    private boolean told(Bite b) {
+        double hp = health().orElse(b.health());
+        Map<String, Double> now = effectsNow();
+        boolean arrived = false;
+        for (Map.Entry<String, Double> e : now.entrySet()) {
+            Double had = b.effects().get(e.getKey());
+            arrived |= had == null || e.getValue() > had + 1e-3;
+        }
+        if (b.taken()) {
+            return arrived || hp > b.health() + 1e-6;
+        }
+        return arrived || Math.abs(hp - b.health()) > 1e-6 || !now.keySet().equals(b.effects().keySet());
+    }
+
+    /** The effects on the player now, each with the seconds it has left (infinite for one without an end). */
+    private Map<String, Double> effectsNow() {
+        Map<String, Double> out = new HashMap<>();
+        OptionalInt self = entities.localEntityId();
+        if (self.isPresent()) {
+            for (EntityTracker.Effect e : entities.effectsOf(self.getAsInt())) {
+                out.put(e.id(), e.infinite() ? Double.POSITIVE_INFINITY : e.secondsLeft());
+            }
+        }
+        return out;
+    }
+
+    /** The player's max health in points - the stat's span - or 100 when core has not said. */
+    private double maxHealth() {
+        OptionalInt self = entities.localEntityId();
+        Optional<EntityTracker.Stat> h = self.isPresent() ? entities.healthOf(self.getAsInt()) : Optional.empty();
+        return h.isPresent() && h.get().max() > h.get().min() ? h.get().max() - h.get().min() : 100;
     }
 
     /** Uses the healing item in {@code slot}, then takes the weapon again. */
@@ -1340,22 +1767,61 @@ final class Fighter {
         if (slot != back) {
             hands.switchHotbarSlot(slot).get(3, TimeUnit.SECONDS);
         }
-        hands.useItem().get(10, TimeUnit.SECONDS);
-        j.heals++;
-        log.info("auto-fighter: healed with {} - health {}", id, health().map(h -> Math.round(h * 100)).orElse(-1L));
+        double hpBefore = health().orElse(1.0);
+        Map<String, Double> effectsBefore = effectsNow();
+        int stackBefore = carried(id);
+        InteractionOutcome used = hands.useItem().get(10, TimeUnit.SECONDS);
+        boolean taken = took(used) || carried(id) < stackBefore;
+        // How things stood: what the use did is told after (see Bite).
+        bite = new Bite(id, taken, hpBefore, effectsBefore, false);
+        if (!taken) {
+            log.info("auto-fighter: {} not taken ({}) - not tried again as things stand", id,
+                    used == null ? "no answer" : used.status());
+        } else {
+            j.heals++;
+            log.info("auto-fighter: healed with {} at health {}", id, Math.round(hpBefore * 100));
+        }
         if (back >= 0 && back != slot && !guarding(j)) {
             hands.switchHotbarSlot(back).get(3, TimeUnit.SECONDS);
         }
     }
 
     /**
-     * Backs off from the enemies - up to {@link #RETREAT} blocks straight away from them, or to the
-     * sides - heals there, and is back to the fight on the next beat.
+     * Whether the server took the item of a use: the step of its chain that takes it from the stack
+     * ({@code ModifyInventoryInteraction} - the server alone runs it, and says how it went) ran and
+     * did not fail. A use refused - a potion's cooldown, a click too soon - ends before it, or fails
+     * there: it heals nothing and is no heal.
      */
-    private void retreat(Job j, int target, Vec3 me) throws Exception {
+    private static boolean took(InteractionOutcome used) {
+        return used != null && used.steps().stream()
+                .anyMatch(st -> st.operation().startsWith("ModifyInventoryInteraction") && !st.failed());
+    }
+
+    /** How many of the item the hotbar holds. */
+    private int carried(String id) {
+        PlayerState.Section s = state == null ? null : state.inventories().get("Hotbar");
+        if (s == null) {
+            return 0;
+        }
+        int n = 0;
+        for (Containers.Item item : s.items().values()) {
+            if (item != null && id.equals(item.id())) {
+                n += item.quantity();
+            }
+        }
+        return n;
+    }
+
+    /**
+     * Begins backing off from the enemies - up to {@link #RETREAT} blocks straight away from them, or
+     * to the sides: the places to try, and the first trip. The beats after go on it ({@link #backOff}),
+     * then on the rest there ({@link #rest}).
+     */
+    private void retreat(Job j, int target, Vec3 me) {
         j.retreats++;
-        j.retreatAgain = System.currentTimeMillis() + RETREAT_COOLDOWN_MS;
+        j.retreated = true;
         stopChase(j);
+        stopRetreat(j);
         Vec3 from = entities.positionOf(target).orElse(me);
         double dx = me.x() - from.x();
         double dz = me.z() - from.z();
@@ -1368,8 +1834,16 @@ final class Fighter {
         dx /= len;
         dz /= len;
         status = "Backing off from " + entities.labelOf(target) + " to heal.";
-        log.info("auto-fighter: health low - backing off");
-        boolean away = false;
+        log.info("auto-fighter: health low ({}) - backing off to rest up to {}",
+                health().map(h -> Math.round(h * 100)).orElse(-1L), j.options().resumeAt());
+        away(me, dx, dz, j.retreatTo);
+        j.retreating = true;
+        backOff(j);
+    }
+
+    /** The places to back off to, {@code (dx, dz)} the way from the enemy: straight away first, then to the sides, nearer. */
+    private void away(Vec3 me, double dx, double dz, java.util.ArrayDeque<Goal> into) {
+        into.clear();
         for (double far : new double[] {RETREAT, 5, 3}) {
             for (double turn : new double[] {0, Math.PI / 4, -Math.PI / 4, Math.PI / 2, -Math.PI / 2}) {
                 double rx = dx * Math.cos(turn) - dz * Math.sin(turn);
@@ -1378,30 +1852,206 @@ final class Fighter {
                 int cz = (int) Math.floor(me.z() + rz * far);
                 int cy = (int) Math.floor(me.y() + 1e-3);
                 Integer y = standY(cx, cy, cz);
-                if (y == null) {
-                    continue;
+                if (y != null) {
+                    into.add(new Goal(cx, y, cz, 1));
                 }
-                NavResult r;
-                CompletableFuture<NavResult> trip = navigator.goTo(new Goal(cx, y, cz, 1));
-                try {
-                    r = trip.get(8, TimeUnit.SECONDS);
-                } catch (java.util.concurrent.TimeoutException slow) {
-                    trip.cancel(false);     // this trip only: a job waiting on the urgent hold keeps its own
-                    continue;
-                }
-                if (r.arrived()) {
-                    away = true;
-                    break;
-                }
-            }
-            if (away) {
-                break;
             }
         }
-        int slot = healSlot();
-        if (slot >= 0) {
+    }
+
+    // ------------------------------------------------------------------
+    // Flight: health low, nothing to heal with (the owner's word, 21.11)
+    // ------------------------------------------------------------------
+
+    /** Begins running from {@code target}: the first leg. */
+    private void beginFlight(Job j, int target, Vec3 me) {
+        j.flights++;
+        j.fleeFrom = target;
+        stopChase(j);
+        stopRetreat(j);
+        j.resting = false;
+        log.info("auto-fighter: health low ({}) and nothing to heal with - running from {} ({}) until it falls behind",
+                health().map(h -> Math.round(h * 100)).orElse(-1L), entities.labelOf(target), target);
+        leg(j, me);
+    }
+
+    /** A leg of the run: the places away from the enemy as it stands now, and the trip to the first. */
+    private void leg(Job j, Vec3 me) {
+        Vec3 from = entities.positionOf(j.fleeFrom).orElse(me);
+        double dx = me.x() - from.x();
+        double dz = me.z() - from.z();
+        double len = Math.hypot(dx, dz);
+        if (len < 1e-3) {
+            dx = 1;
+            dz = 0;
+            len = 1;
+        }
+        away(me, dx / len, dz / len, j.fleeTo);
+        j.fleeGap = dist(from, me);
+        j.fleeTrip = null;
+        status = "Running from " + entities.labelOf(j.fleeFrom) + ": health low, nothing to heal with.";
+    }
+
+    /**
+     * A beat of the run. The trip under way goes on. A leg over: the enemy gone, or farther than it
+     * senses (than the radius set, for a kind the game's files tell nothing of) - it has fallen
+     * behind, and the run is over; the gap no wider than when the leg began - it
+     * keeps up, running does not shake it off, and it is fought; else the next leg. With no place to
+     * run to it is fought as well.
+     *
+     * @return whether the beat went on running
+     */
+    private boolean flee(Job j, Vec3 me) {
+        int from = j.fleeFrom;
+        Vec3 at = entities.positionOf(from).orElse(null);
+        if (at == null || !alive(from)) {
+            fled(j, "it is gone");
+            return false;
+        }
+        CompletableFuture<NavResult> trip = j.fleeTrip;
+        if (trip != null && !trip.isDone()) {
+            return true;        // on the way: the leg ends by getting there, or by there being no way
+        }
+        NavResult r = trip == null || trip.isCancelled() || trip.isCompletedExceptionally() ? null : trip.getNow(null);
+        j.fleeTrip = null;
+        if (r != null && r.arrived()) {
+            double gap = dist(at, me);
+            if (!noticedBy(from, gap, j.options().radius())) {
+                fled(j, String.format(Locale.ROOT, "it fell behind, %.0f blocks off", gap));
+                return false;
+            }
+            if (gap < j.fleeGap + GAINED) {
+                fled(j, String.format(Locale.ROOT, "it keeps up (%.0f blocks off, %.0f when the leg began) - fought", gap, j.fleeGap));
+                return false;
+            }
+            leg(j, me);         // farther, and within its senses still: on
+        }
+        Goal next = j.fleeTo.poll();
+        if (next == null) {
+            fled(j, "nowhere to run to - fought");
+            return false;
+        }
+        j.fleeTrip = navigator.goTo(next);
+        return true;
+    }
+
+    /** The run is over: its enemy is not run from again ({@link #fledFrom}). */
+    private void fled(Job j, String how) {
+        int from = j.fleeFrom;
+        if (from < 0) {
+            return;
+        }
+        fledFrom.add(from);
+        log.info("auto-fighter: the run from {} ({}) is over - {}", entities.labelOf(from), from, how);
+        stopFlee(j);
+        if (j.target == from) {
+            j.target = -1;
+            unmark();
+        }
+    }
+
+    private void stopFlee(Job j) {
+        CompletableFuture<NavResult> trip = j.fleeTrip;
+        j.fleeTrip = null;
+        j.fleeTo.clear();
+        j.fleeFrom = -1;
+        if (trip != null && !trip.isDone()) {
+            trip.cancel(false);     // this trip only: a job waiting on the urgent hold keeps its own
+        }
+    }
+
+    /**
+     * A beat of backing off: the trip to the place being tried goes on; one that did not get there
+     * (no way, blocked) gives way to the next place. Over - and the rest begins - on getting to one,
+     * or with no place left to try: then the rest is where the body stands.
+     *
+     * @return whether the beat went on it
+     */
+    private boolean backOff(Job j) {
+        CompletableFuture<NavResult> trip = j.retreatTrip;
+        if (trip != null && !trip.isDone()) {
+            return true;        // on the way: it ends by getting there or by there being no way
+        }
+        NavResult r = trip == null || trip.isCancelled() || trip.isCompletedExceptionally() ? null : trip.getNow(null);
+        j.retreatTrip = null;
+        Goal next = r != null && r.arrived() ? null : j.retreatTo.poll();
+        if (next == null) {
+            j.retreatTo.clear();
+            j.retreating = false;
+            j.resting = true;
+            j.restBites = true;
+            return false;
+        }
+        j.retreatTrip = navigator.goTo(next);
+        return true;
+    }
+
+    private void stopRetreat(Job j) {
+        CompletableFuture<NavResult> trip = j.retreatTrip;
+        j.retreatTrip = null;
+        j.retreatTo.clear();
+        j.retreating = false;
+        if (trip != null && !trip.isDone()) {
+            trip.cancel(false);     // this trip only: a job waiting on the urgent hold keeps its own
+        }
+    }
+
+    /**
+     * After a fight, with no enemy about: whether the body is kept to rest - the fight left the health
+     * under {@link Options#resumeAt} and something is bringing it back ({@link #rest}).
+     */
+    private boolean restsAfter(Job j) throws Exception {
+        double hp = health().orElse(1.0);
+        if (j.retreating && backOff(j)) {
+            return true;
+        }
+        if (!j.resting && hp * 100 < j.options().resumeAt()) {
+            j.resting = true;
+            j.restBites = false;
+        }
+        return j.resting && rest(j, -1, hp);
+    }
+
+    /**
+     * A beat of rest - after a retreat, or after a fight that left the health low: the body stands
+     * out of the fight while the healing under way brings the health back to {@link Options#resumeAt},
+     * with a bite where that falls short - after a retreat whenever it does, else only with the health
+     * at the owner's own mark for eating ({@link Options#healAt}). Over when the health is back, or when nothing is bringing it
+     * back - no healing under way, none on its way from a bite just taken, and no bite to take. However
+     * long that is: a food's slow heal runs for minutes. An enemy that came after the body
+     * ({@code target}, in its reach or hitting) is fought - this beat is not a rest.
+     *
+     * @return whether the beat went on the rest
+     */
+    private boolean rest(Job j, int target, double hp) throws Exception {
+        int back = j.options().resumeAt();
+        int slot = hp * 100 < back && (j.restBites || hp * 100 <= j.options().healAt()) ? healSlot() : -1;
+        boolean bite = slot >= 0 && worthABite(gainOf(slot), hp, back, false);
+        String over = null;
+        if (hp * 100 >= back) {
+            over = "the health is back";
+        } else if (hands.healing().overTime() <= 0 && !awaited() && !bite) {
+            over = "nothing heals it";
+        }
+        if (over != null) {
+            j.resting = false;
+            j.restBites = false;
+            log.info("auto-fighter: the rest is over - {} (health {})", over, Math.round(hp * 100));
+            return false;
+        }
+        if (target >= 0 && (eyesTo(target) <= ENEMY_REACH + 1
+                || combat != null && combat.hitBy(target, Duration.ofSeconds(1)))) {
+            return false;   // it came after us: fought, not waited out
+        }
+        stopChase(j);
+        movement.stop();
+        if (bite) {
             heal(j, slot);
+            return true;
         }
+        status = String.format(Locale.ROOT, "Resting: health %d%%, back to the fight at %d%%.",
+                Math.round(hp * 100), back);
+        return true;
     }
 
     /** The height to stand at in the column near {@code y}: the cell itself, one up or one down; {@code null} for none. */
@@ -1414,19 +2064,25 @@ final class Fighter {
         return null;
     }
 
-    /** The player's own health, as a share of its max; empty when core has not been told. */
+    /**
+     * The player's own health, as a share of its max; empty when core has not been told - or tells
+     * none at all: that is a dead body's, or one alive again a moment ago whose health the server has
+     * not said yet (it does after the revival). Nothing to judge by: a body just back alive ate a pie
+     * for the nought it had died with (22.11).
+     */
     private Optional<Double> health() {
         OptionalInt self = entities.localEntityId();
         if (self.isPresent()) {
             Optional<EntityTracker.Stat> h = entities.healthOf(self.getAsInt());
             if (h.isPresent() && h.get().max() > h.get().min()) {
-                return Optional.of(h.get().fraction());
+                double share = h.get().fraction();
+                return share > 0 ? Optional.of(share) : Optional.empty();
             }
         }
         if (state != null) {
             Double v = state.stats().get("Health");
             if (v != null) {
-                return Optional.of(v / 100.0);
+                return v > 0 ? Optional.of(v / 100.0) : Optional.empty();
             }
         }
         return Optional.empty();
@@ -1515,7 +2171,7 @@ final class Fighter {
             return;
         }
         status = "Picking up " + drops.size() + " drop(s).";
-        worker.pickUp(drops).get(2, TimeUnit.MINUTES);
+        worker.pickUp(drops).get();     // over when they are picked up, or cannot be got to
         j.lying.addAll(drops);
     }
 
@@ -1527,7 +2183,9 @@ final class Fighter {
     private void pass(Job j, int id, String why) {
         long now = System.currentTimeMillis();
         j.passed.values().removeIf(t -> t < now);
+        j.passedAt.keySet().retainAll(j.passed.keySet());
         j.passed.put(id, now + PASS_MS);
+        entities.positionOf(id).ifPresent(at -> j.passedAt.put(id, at));
         log.info("auto-fighter: {} ({}) left alone for {} s: {}", entities.labelOf(id), id, PASS_MS / 1000, why);
     }
 
